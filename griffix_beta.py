@@ -696,28 +696,62 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         font-weight: 600;
     }
 
+    /* Solid warning & success badges with high-contrast white text */
     .warning-pill {
-        background: rgba(255, 71, 87, 0.2);
-        border: 1px solid #ff4757;
-        color: #ff6b81;
-        font-size: 9.5px;
-        padding: 3px 6px;
-        border-radius: 4px;
-        margin-top: 6px;
-        display: inline-block;
-        font-weight: 700;
+        background-color: #d63031 !important;
+        color: #ffffff !important;
+        border: none !important;
+        font-size: 10px !important;
+        padding: 4px 8px !important;
+        border-radius: 4px !important;
+        margin-top: 6px !important;
+        display: inline-block !important;
+        font-weight: 700 !important;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
     }
 
     .success-pill {
-        background: rgba(46, 213, 115, 0.2);
-        border: 1px solid #2ed573;
-        color: #2ed573;
-        font-size: 9.5px;
-        padding: 2px 6px;
-        border-radius: 4px;
-        margin-top: 5px;
-        display: inline-block;
-        font-weight: 700;
+        background-color: #00b894 !important;
+        color: #ffffff !important;
+        border: none !important;
+        font-size: 10px !important;
+        padding: 4px 8px !important;
+        border-radius: 4px !important;
+        margin-top: 6px !important;
+        display: inline-block !important;
+        font-weight: 700 !important;
+        box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+    }
+
+    /* Red outline & glowing shadow when prerequisite is unsatisfied */
+    .course-card.has-prereq-error {
+        border: 2px solid #ff4757 !important;
+        box-shadow: 0 0 14px rgba(255, 71, 87, 0.9) !important;
+    }
+
+    .course-card.has-prereq-error.is-selected {
+        border: 2px solid #ff4757 !important;
+        box-shadow: 0 0 18px rgba(255, 71, 87, 1) !important;
+        animation: pulse-red 1.6s infinite !important;
+    }
+
+    @keyframes pulse-red {
+        0% { box-shadow: 0 0 6px rgba(255, 71, 87, 0.5); }
+        50% { box-shadow: 0 0 20px rgba(255, 71, 87, 1); }
+        100% { box-shadow: 0 0 6px rgba(255, 71, 87, 0.5); }
+    }
+
+    /* Fixed-width holding grid (prevents single courses from stretching 100%) */
+    .holding-grid {
+        display: grid;
+        grid-template-columns: repeat(auto-fill, 230px);
+        gap: 12px;
+        min-height: 60px;
+        padding: 12px;
+        background: rgba(0, 0, 0, 0.25);
+        border: 1px dashed var(--border-color);
+        border-radius: 8px;
+        overflow: visible !important;
     }
     
     /* Progression Matrix */
@@ -880,6 +914,10 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                 warns = warnings_dict.get(c, [])
                 sats = st.session_state.get('plan_satisfied_dict', {}).get(c, [])
 
+                # Add glowing red border class if prerequisite is unsatisfied
+                has_prereq_issue = any("prereq" in str(w).lower() for w in warns)
+                prereq_glow_class = "has-prereq-error" if has_prereq_issue else ""
+
                 badges_html = ""
                 if warns:
                     badges_html += f"<div class='warning-pill' title='{'; '.join(warns)}'>⚠️ {warns[0]}</div>"
@@ -889,7 +927,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                 offs = format_offerings_label(c_data.get("offerings", []))
 
                 html += f"""
-                <div class="course-card {is_sel}" style="background-color: {bg};" onclick="onCourseClick('{c}')">
+                <div class="course-card {is_sel} {prereq_glow_class}" style="background-color: {bg};" onclick="onCourseClick('{c}')">
                     <div class="card-top">
                         <span class="card-code">{c}</span>
                         <span class="btn-close" onclick="onMoveToHolding(event, '{c}', {yr}, {tr})" title="Unschedule to Holding Zone">&times;</span>
@@ -902,7 +940,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                     {badges_html}
                 </div>
                 """
-
             # N + 1 Dynamic Target Slot (Max 7 courses per trimester)
             if n_courses < 7:
                 if selected_code:
