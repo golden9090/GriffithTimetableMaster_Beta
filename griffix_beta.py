@@ -3,6 +3,9 @@ import streamlit.components.v1 as components
 import requests
 import json
 import re
+import hashlib
+import colorsys
+from datetime import datetime
 
 st.warning("**IMPORTANT**: THIS SITE IS A BETA VERSION OF GRIFFIX FEATURES, AND ONLY INCLUDES **EXPERIMENTAL FEATURES UNDERGOING TESTING**. ACCESS THE OFFICIAL VERSION OF GRIFFIX [HERE](https://griffix.streamlit.app)")
 
@@ -144,56 +147,113 @@ def load_full_catalog():
     return catalog
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def fetch_single_course_from_api(course_code: str):
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalog_offerings: list):
     """
-    Direct fallback for specific courses (e.g. 2022MSC) using Griffith's REST API.
+    Fetches structured metadata and requisites from the Curriculum API.
+    Term mapping: 3261 (T1), 3265 (T2), 3268 (T3/Summer).
+    Falls back to prior year if the current/requested year is unreleased.
     """
-    url = f"https://degrees.griffith.edu.au/rest-api/v3/course/{course_code}"
+    subscription_key = "b8ae10d400ef42f89a127abe4a760e46"
+    
+    # 1. Determine earliest offered trimester
+    offs_lower = [str(o).lower() for o in catalog_offerings]
+    if any("trimester 1" in o or "t1" in o for o in offs_lower):
+        primary_term = "3261"
+    elif any("trimester 2" in o or "t2" in o for o in offs_lower):
+        primary_term = "3265"
+    elif any("summer" in o or "trimester 3" in o or "t3" in o for o in offs_lower):
+        primary_term = "3268"
+    else:
+        primary_term = "3261"
+
+    terms_to_try = [primary_term] + [t for t in ["3261", "3265", "3268"] if t != primary_term]
+
+    # 2. Year determination: Cap future selections to the current year
+    current_year = datetime.now().year
+    search_year = min(selected_year, current_year)
+    years_to_try = [search_year, search_year - 1]
+
     headers = {
-        'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
-        'Accept': 'application/json'
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "Ocp-Apim-Subscription-Key": subscription_key,
+        "Origin": "https://my.griffith.edu.au",
+        "Referer": "https://my.griffith.edu.au/"
     }
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            d = resp.json()
-            desc = d.get("description", "") or d.get("summary", "") or ""
-            offerings = []
-            for off in d.get("offerings", []):
-                term = off.get("offeringTerm", {})
-                cat = term.get("category", "")
-                if cat:
-                    offerings.append(cat)
 
-            return {
-                "code": course_code,
-                "title": d.get("name", course_code),
-                "credit_points": str(d.get("creditPointValue", 10)),
-                "description": desc,
-                "offerings": list(set(offerings)),
-                "career": d.get("career", {}).get("name", "Undergraduate"),
-                "group": d.get("school", {}).get("group", {}).get("name", "Other"),
-                "prereqs": extract_prereqs(desc),
-                "coreqs": extract_coreqs(desc),
-                "incompatibles": extract_incompatibles(desc)
-            }
-    except Exception:
-        pass
+    for yr in years_to_try:
+        for term_code in terms_to_try:
+            url = f"https://api-lt.griffith.edu.au/curriculumapi/v1/course/{clean_code}/{yr}/{term_code}?subscription-key={subscription_key}"
+            try:
+                resp = requests.get(url, headers=headers, timeout=10)
+                if resp.status_code == 200:
+                    data = resp.json()
+                    mapped = data.get("mappedData", {}).get("components", {})
+
+                    # Extract requisites from structured crseRequiste component
+                    prereqs, coreqs, incompatibles = [], [], []
+                    req_obj = mapped.get("crseRequiste", {}).get("value", {})
+                    if isinstance(req_obj, dict):
+                        for r in req_obj.get("requisites", []):
+                            rtype = str(r.get("type", "")).upper()
+                            combined_text = f"{r.get('ruleDefinition', '')} {r.get('ruleSummary', '')}"
+                            codes = extract_course_codes(combined_text)
+                            if "PRE" in rtype:
+                                prereqs.extend(codes)
+                            elif "CO" in rtype:
+                                coreqs.extend(codes)
+                            elif "ANTI" in rtype:
+                                incompatibles.extend(codes)
+
+                    # Check for unstructured other requisites
+                    other_req = mapped.get("crseOthrRequiste", {}).get("value")
+                    if other_req and isinstance(other_req, str):
+                        prereqs.extend(extract_course_codes(other_req))
+
+                    # Deduplicate while preserving order
+                    prereqs = [p for p in dict.fromkeys(prereqs) if p != clean_code]
+                    coreqs = [c for c in dict.fromkeys(coreqs) if c != clean_code]
+                    incompatibles = [i for i in dict.fromkeys(incompatibles) if i != clean_code]
+
+                    title = data.get("name") or mapped.get("crseShrtDescr", {}).get("value") or clean_code
+                    cp_val = mapped.get("crseAwrdCrdtPnts", {}).get("value", {})
+                    cp = str(cp_val.get("value", 10) if isinstance(cp_val, dict) else data.get("unitsMinimum", 10))
+
+                    desc = mapped.get("crseDescr", {}).get("value", "")
+
+                    return {
+                        "code": clean_code,
+                        "title": title,
+                        "credit_points": cp,
+                        "description": desc,
+                        "offerings": catalog_offerings,
+                        "career": data.get("subtype", "Undergraduate"),
+                        "group": data.get("orgParent", "Other"),
+                        "prereqs": prereqs,
+                        "coreqs": coreqs,
+                        "incompatibles": incompatibles
+                    }
+            except Exception:
+                continue
+
     return None
 
-catalog = load_full_catalog()
+def lookup_course(clean_code: str, selected_year: int = None):
+    """Finds course using the cached 3000-catalog, then retrieves requisites via the Curriculum API."""
+    if selected_year is None:
+        selected_year = datetime.now().year
 
-def lookup_course(clean_code: str):
-    """Checks the cached catalog first; if absent, fetches from the live course endpoint."""
-    if clean_code in catalog:
-        return catalog[clean_code]
-    direct_res = fetch_single_course_from_api(clean_code)
-    if direct_res:
-        catalog[clean_code] = direct_res
-        return direct_res
-    return None
+    catalog_entry = catalog.get(clean_code, {})
+    offerings = catalog_entry.get("offerings", [])
 
-# -----------------------------------------------------------------------------
+    curriculum_meta = fetch_course_from_curriculum_api(clean_code, selected_year, offerings)
+    if curriculum_meta:
+        catalog[clean_code] = curriculum_meta
+        return curriculum_meta
+
+    if catalog_entry:
+        return catalog_entry
+    return None# -----------------------------------------------------------------------------
 # 3. OFFERING AVAILABILITY CHECKER
 # -----------------------------------------------------------------------------
 def is_course_offered_in_term(c_info: dict, trimester: int) -> bool:
@@ -349,11 +409,18 @@ if bridge_input:
 with st.sidebar:
     st.header("1. Add a Course")
 
+    current_yr = datetime.now().year
     with st.form("course_search_form", clear_on_submit=True):
         course_code_input = st.text_input(
             "Course Code",
             placeholder="eg. 1001MSC",
             key="input_course_code"
+        )
+        planned_year = st.selectbox(
+            "Which year are you planning to do the course?",
+            options=list(range(current_yr, 2031)),
+            index=0,
+            key="planned_course_year"
         )
         submit_btn = st.form_submit_button("Add Course", type="primary")
 
@@ -362,10 +429,8 @@ with st.sidebar:
         if not course_code_input:
             st.session_state.feedback_message = ("warning", "Please enter a course code.")
         else:
-            # Capitalise and strip all spaces
             clean_code = course_code_input.replace(" ", "").upper().strip()
-
-            c_info = lookup_course(clean_code)
+            c_info = lookup_course(clean_code, planned_year)
 
             if c_info:
                 already_in_holding = clean_code in st.session_state.holding_zone
@@ -414,18 +479,16 @@ with st.sidebar:
 # -----------------------------------------------------------------------------
 # 7. HTML, CSS & JS COMPONENT BUILDER
 # -----------------------------------------------------------------------------
-def get_faculty_color(group_name: str) -> str:
-    """Colors aligned with Griffith academic groups."""
-    g = group_name.lower()
-    if "health" in g:
-        return "#00897b"  # Teal / Emerald
-    elif "sciences" in g or "engineering" in g:
-        return "#1976d2"  # Griffith Ocean Blue
-    elif "business" in g:
-        return "#d35400"  # Amber Orange
-    elif "arts" in g or "education" in g or "law" in g or "music" in g:
-        return "#7b1fa2"  # Royal Purple
-    return "#455a64"      # Slate
+def string_to_pastel_hex(code_string: str) -> str:
+    """Generates a deterministic pastel hex color from the course code."""
+    clean_code = str(code_string).strip().upper()
+    hash_digest = hashlib.md5(clean_code.encode()).hexdigest()
+    hash_int = int(hash_digest[:8], 16)
+    hue = (hash_int % 360) / 360.0
+    saturation = 0.65
+    lightness = 0.55
+    rgb = colorsys.hls_to_rgb(hue, lightness, saturation)
+    return '#%02x%02x%02x' % tuple(int(x * 255) for x in rgb)
 
 def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, selected_code, warnings_dict):
     trimesters = [1, 2, 3] if include_t3 else [1, 2]
@@ -684,7 +747,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
 
     for code in holding_zone:
         info = catalog_dict.get(code) or lookup_course(code) or {"title": code, "credit_points": "10", "offerings": [], "prereqs": [], "coreqs": [], "group": ""}
-        bg = get_faculty_color(info.get("group", ""))
+        bg = string_to_pastel_hex(code)
         is_sel = "is-selected" if code == selected_code else ""
 
         pr_text = f"Pre: {', '.join(info['prereqs'])}" if info["prereqs"] else "No Prereqs"
@@ -734,14 +797,14 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
             <div class="trim-col">
                 <div class="trim-header">
                     <span>{t_title}</span>
-                    <span>{cp_sum} CP ({n_courses}/7)</span>
+                    <span>{cp_sum} CP</span>
                 </div>
             """
 
             # Render Scheduled Cards
             for c in scheduled:
                 c_data = catalog_dict.get(c) or lookup_course(c) or {"title": c, "credit_points": "10", "offerings": [], "group": ""}
-                bg = get_faculty_color(c_data.get("group", ""))
+                bg = string_to_pastel_hex(c)
                 is_sel = "is-selected" if c == selected_code else ""
                 warns = warnings_dict.get(c, [])
 
