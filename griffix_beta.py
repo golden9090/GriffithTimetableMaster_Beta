@@ -4,13 +4,16 @@ import requests
 import json
 import re
 
+st.warning("**IMPORTANT**: THIS SITE IS A BETA VERSION OF GRIFFIX FEATURES, AND ONLY INCLUDES **EXPERIMENTAL FEATURES UNDERGOING TESTING**. ACCESS THE OFFICIAL VERSION OF GRIFFIX [HERE](https://griffix.streamlit.app)")
+
+
 # -----------------------------------------------------------------------------
 # 1. PAGE CONFIGURATION & STATE (CLEAN START)
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="Griffix Degree Planner",
     layout="wide",
-    page_icon="🎓",
+    page_icon="Picture1.png",
     initial_sidebar_state="expanded"
 )
 
