@@ -1,13 +1,11 @@
 import streamlit as st
 import streamlit.components.v1 as components
-import urllib.request
-import urllib.parse
+import requests
 import json
-import os
 import re
 
 # -----------------------------------------------------------------------------
-# 1. PAGE CONFIGURATION & SESSION STATE (CLEAN NULL START)
+# 1. PAGE CONFIGURATION & STATE (CLEAN START)
 # -----------------------------------------------------------------------------
 st.set_page_config(
     page_title="Griffix Degree Planner",
@@ -16,7 +14,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Initialise completely clean state on launch
+# Start with a clean, empty state
 if "holding_zone" not in st.session_state:
     st.session_state.holding_zone = []
 
@@ -30,47 +28,14 @@ if "selected_course" not in st.session_state:
 if "last_action_token" not in st.session_state:
     st.session_state.last_action_token = None
 
-if "search_msg" not in st.session_state:
-    st.session_state.search_msg = None
+if "feedback_message" not in st.session_state:
+    st.session_state.feedback_message = None
 
 # -----------------------------------------------------------------------------
-# 2. CACHED GRIFFITH CATALOG FETCHER (24-Hour TTL)
+# 2. COURSE METADATA & LIVE SEARCH / CACHE ENGINE
 # -----------------------------------------------------------------------------
-FALLBACK_COURSES = {
-    "1001PSY": {
-        "code": "1001PSY", "title": "Introduction to Psychology 1", "credit_points": "10",
-        "description": "Prerequisites: NIL Co-requisites: NIL. Cognitive and biological bases of behaviour.",
-        "offerings": ["Trimester 1", "Summer Semester"], "career": "Undergraduate", "group": "Griffith Health",
-        "prereqs": [], "coreqs": [], "incompatibles": ["1015HSV"]
-    },
-    "1003PSY": {
-        "code": "1003PSY", "title": "Research Methods and Statistics in Psychology", "credit_points": "10",
-        "description": "Prerequisites: Nil Co-requisites: Nil. Data gathering in psychology.",
-        "offerings": ["Trimester 2", "Summer Semester"], "career": "Undergraduate", "group": "Griffith Health",
-        "prereqs": [], "coreqs": [], "incompatibles": ["1014SCG", "1305AFE"]
-    },
-    "2000PSY": {
-        "code": "2000PSY", "title": "Experimental Design and Analysis", "credit_points": "10",
-        "description": "Prerequisites: 1003PSY Research Methods and Statistics in Psychology OR 1305AFE. Competence in SPSS.",
-        "offerings": ["Trimester 1"], "career": "Undergraduate", "group": "Griffith Health",
-        "prereqs": ["1003PSY"], "coreqs": [], "incompatibles": []
-    },
-    "1010ENG": {
-        "code": "1010ENG", "title": "Engineering Mathematics 1", "credit_points": "10",
-        "description": "Vectors, matrices, complex numbers. Prerequisites: Nil.",
-        "offerings": ["Trimester 1", "Summer Semester"], "career": "Undergraduate", "group": "Griffith Sciences",
-        "prereqs": [], "coreqs": [], "incompatibles": ["1201SCG"]
-    },
-    "2004ENG": {
-        "code": "2004ENG", "title": "Hydrology", "credit_points": "10",
-        "description": "Prerequisite: 1010ENG Engineering Mathematics 1. Hydrological processes.",
-        "offerings": ["Trimester 2"], "career": "Undergraduate", "group": "Griffith Sciences",
-        "prereqs": ["1010ENG"], "coreqs": [], "incompatibles": []
-    }
-}
-
 def extract_course_codes(text: str):
-    """Extracts valid Griffith course codes (e.g. 1001MSC, 2004ENG, 6091CCJ_P1, IBA306)."""
+    """Finds valid Griffith course codes."""
     if not text:
         return []
     pattern = r'\b(?:[0-9]{4}[A-Z]{3,4}(?:_[A-Z0-9]+)?|[A-Z]{3}[0-9]{3})\b'
@@ -78,88 +43,152 @@ def extract_course_codes(text: str):
     return list(dict.fromkeys(m.upper() for m in matches))
 
 def extract_prereqs(desc: str):
-    if not desc: return []
+    if not desc:
+        return []
     match = re.search(r'(?:pre-?requisite(?:s)?|advised prerequisite(?:s)?|prior knowledge of)\s*[:\-]?\s*([^.;\n]+)', desc, re.I)
     if match:
         chunk = match.group(1)
-        if "nil" in chunk.lower() or "none" in chunk.lower(): return []
+        if "nil" in chunk.lower() or "none" in chunk.lower():
+            return []
         return extract_course_codes(chunk)
     return []
 
 def extract_coreqs(desc: str):
-    if not desc: return []
+    if not desc:
+        return []
     match = re.search(r'(?:co-?requisite(?:s)?)\s*[:\-]?\s*([^.;\n]+)', desc, re.I)
     if match:
         chunk = match.group(1)
-        if "nil" in chunk.lower() or "none" in chunk.lower(): return []
+        if "nil" in chunk.lower() or "none" in chunk.lower():
+            return []
         return extract_course_codes(chunk)
     return []
 
 def extract_incompatibles(desc: str):
-    if not desc: return []
+    if not desc:
+        return []
     match = re.search(r'(?:incompatible(?:s)?)\s*[:\-]?\s*([^.;\n]+)', desc, re.I)
     if match:
         return extract_course_codes(match.group(1))
     return []
 
 @st.cache_data(ttl=86400, show_spinner=False)
-def load_griffith_catalog():
-    """Fetches up to 3000 courses from Griffith Funnelback API with 24-hr cache."""
-    url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&num_ranks=3000&start_rank=1&sort=metafborderna"
-    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-    data = None
-
-    # Check local cache fallback if present
-    for local_file in ["coursesearch_shorter_800.json", "coursesearch.json"]:
-        if os.path.exists(local_file):
-            try:
-                with open(local_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    break
-            except Exception:
-                pass
-
-    if data is None:
-        try:
-            req = urllib.request.Request(url, headers=headers)
-            with urllib.request.urlopen(req, timeout=12) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-        except Exception:
-            return FALLBACK_COURSES
-
-    raw_results = data.get("response", {}).get("resultPacket", {}).get("results", [])
-    if not raw_results:
-        return FALLBACK_COURSES
-
+def load_full_catalog():
+    """
+    Fetches courses directly from Griffith's search endpoint with pagination
+    and caches the result for 24 hours.
+    """
     catalog = {}
-    for item in raw_results:
-        meta = item.get("listMetadata", {})
-        cat_numbers = meta.get("categoryNumber", [])
-        if not cat_numbers:
-            continue
-        code = str(cat_numbers[0]).strip().upper()
-        title = meta.get("title", [code])[0]
-        cp = meta.get("creditPoints", ["10"])[0]
-        desc = meta.get("description", [""])[0] or ""
-        offerings = meta.get("nextOffering", [])
-        career = meta.get("academicCareerName", ["Undergraduate"])[0]
-        group = meta.get("academicGrpDescription", ["Other"])[0]
+    headers = {
+        'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
+        'Accept': 'application/json, text/plain, */*'
+    }
+    base_url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&sort=metafborderna"
+    
+    start_rank = 1
+    num_ranks = 800
 
-        catalog[code] = {
-            "code": code,
-            "title": title,
-            "credit_points": cp,
-            "description": desc,
-            "offerings": list(set(offerings)),
-            "career": career,
-            "group": group,
-            "prereqs": extract_prereqs(desc),
-            "coreqs": extract_coreqs(desc),
-            "incompatibles": extract_incompatibles(desc)
-        }
+    while True:
+        url = f"{base_url}&num_ranks={num_ranks}&start_rank={start_rank}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=20)
+            if resp.status_code != 200:
+                break
+            data = resp.json()
+        except Exception:
+            break
+
+        results_summary = data.get("response", {}).get("resultsSummary", {})
+        results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+
+        if not results:
+            break
+
+        for item in results:
+            meta = item.get("listMetadata", {})
+            cat_numbers = meta.get("categoryNumber", [])
+            if not cat_numbers:
+                continue
+            code = str(cat_numbers[0]).replace(" ", "").upper().strip()
+            title = meta.get("title", [code])[0]
+            cp = meta.get("creditPoints", ["10"])[0]
+            desc = meta.get("description", [""])[0] or ""
+            offerings = meta.get("nextOffering", [])
+            career = meta.get("academicCareerName", ["Undergraduate"])[0]
+            group = meta.get("academicGrpDescription", ["Other"])[0]
+
+            catalog[code] = {
+                "code": code,
+                "title": title,
+                "credit_points": cp,
+                "description": desc,
+                "offerings": list(set(offerings)),
+                "career": career,
+                "group": group,
+                "prereqs": extract_prereqs(desc),
+                "coreqs": extract_coreqs(desc),
+                "incompatibles": extract_incompatibles(desc)
+            }
+
+        total_matching = results_summary.get("totalMatching", 0)
+        curr_end = results_summary.get("currEnd", start_rank + len(results) - 1)
+        next_start = results_summary.get("nextStart")
+
+        if not next_start or curr_end >= total_matching:
+            break
+        start_rank = next_start
+
     return catalog
 
-catalog = load_griffith_catalog()
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_single_course_from_api(course_code: str):
+    """
+    Direct fallback for specific courses (e.g. 2022MSC) using Griffith's REST API.
+    """
+    url = f"https://degrees.griffith.edu.au/rest-api/v3/course/{course_code}"
+    headers = {
+        'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
+        'Accept': 'application/json'
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            d = resp.json()
+            desc = d.get("description", "") or d.get("summary", "") or ""
+            offerings = []
+            for off in d.get("offerings", []):
+                term = off.get("offeringTerm", {})
+                cat = term.get("category", "")
+                if cat:
+                    offerings.append(cat)
+
+            return {
+                "code": course_code,
+                "title": d.get("name", course_code),
+                "credit_points": str(d.get("creditPointValue", 10)),
+                "description": desc,
+                "offerings": list(set(offerings)),
+                "career": d.get("career", {}).get("name", "Undergraduate"),
+                "group": d.get("school", {}).get("group", {}).get("name", "Other"),
+                "prereqs": extract_prereqs(desc),
+                "coreqs": extract_coreqs(desc),
+                "incompatibles": extract_incompatibles(desc)
+            }
+    except Exception:
+        pass
+    return None
+
+catalog = load_full_catalog()
+
+def lookup_course(clean_code: str):
+    """Checks the cached catalog first; if absent, fetches from the live course endpoint."""
+    if clean_code in catalog:
+        return catalog[clean_code]
+    direct_res = fetch_single_course_from_api(clean_code)
+    if direct_res:
+        catalog[clean_code] = direct_res
+        return direct_res
+    return None
 
 # -----------------------------------------------------------------------------
 # 3. OFFERING AVAILABILITY CHECKER
@@ -170,8 +199,8 @@ def is_course_offered_in_term(c_info: dict, trimester: int) -> bool:
         return True
     offerings = c_info.get("offerings", [])
     if not offerings:
-        return True  # If unknown, allow placement
-    offs_lower = [o.lower() for o in offerings]
+        return True  # If unknown, don't lock the student out
+    offs_lower = [str(o).lower() for o in offerings]
     if trimester == 1:
         return any("trimester 1" in o or "t1" in o for o in offs_lower)
     elif trimester == 2:
@@ -200,7 +229,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
         current_rank = term_index(yr, tr)
         for c in courses:
             c_warns = []
-            info = catalog_dict.get(c, {})
+            info = catalog_dict.get(c) or lookup_course(c) or {}
             prereqs = info.get("prereqs", [])
             coreqs = info.get("coreqs", [])
             incomps = info.get("incompatibles", [])
@@ -212,7 +241,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
             # 2. Prerequisite Check (Must occur strictly earlier)
             for p in prereqs:
                 if p not in placed_coords:
-                    c_warns.append(f"Missing Prereq: {p}")
+                    c_warns.append(f"Missing Prerequisite: {p}")
                 else:
                     p_yr, p_tr = placed_coords[p]
                     if term_index(p_yr, p_tr) >= current_rank:
@@ -221,7 +250,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
             # 3. Corequisite Check (Must occur in same or earlier trimester)
             for cr in coreqs:
                 if cr not in placed_coords:
-                    c_warns.append(f"Missing Coreq: {cr}")
+                    c_warns.append(f"Missing Corequisite: {cr}")
                 else:
                     cr_yr, cr_tr = placed_coords[cr]
                     if term_index(cr_yr, cr_tr) > current_rank:
@@ -275,21 +304,22 @@ if bridge_input:
             target_yr = int(parts[3])
             target_tr = int(parts[4])
 
-            # Remove from holding zone if present
-            if code in st.session_state.holding_zone:
-                st.session_state.holding_zone.remove(code)
+            c_info = catalog.get(code) or lookup_course(code)
 
-            # Remove from any previous slot in plan
-            for slot, c_list in list(st.session_state.plan.items()):
-                if code in c_list:
-                    c_list.remove(code)
+            # Strictly enforce that courses can only be placed into open trimesters
+            if is_course_offered_in_term(c_info, target_tr):
+                if code in st.session_state.holding_zone:
+                    st.session_state.holding_zone.remove(code)
 
-            # Insert into targeted trimester slot (up to 7 courses max)
-            slot_courses = st.session_state.plan.setdefault((target_yr, target_tr), [])
-            if code not in slot_courses and len(slot_courses) < 7:
-                slot_courses.append(code)
+                for slot, c_list in list(st.session_state.plan.items()):
+                    if code in c_list:
+                        c_list.remove(code)
 
-            st.session_state.selected_course = None
+                slot_courses = st.session_state.plan.setdefault((target_yr, target_tr), [])
+                if code not in slot_courses and len(slot_courses) < 7:
+                    slot_courses.append(code)
+
+                st.session_state.selected_course = None
 
         elif cmd == "REMOVE_HOLDING":
             code = parts[2]
@@ -315,54 +345,48 @@ if bridge_input:
 # -----------------------------------------------------------------------------
 with st.sidebar:
     st.header("1. Add a Course")
-    
-    # Form layout matching timetablegenWEB exactly
+
     with st.form("course_search_form", clear_on_submit=True):
-        search_query = st.text_input(
-            "Course Code or Title", 
-            placeholder="eg. 1001MSC or Chemistry",
-            key="input_course_query"
+        course_code_input = st.text_input(
+            "Course Code",
+            placeholder="eg. 1001MSC",
+            key="input_course_code"
         )
         submit_btn = st.form_submit_button("Add Course", type="primary")
 
-    if submit_btn and search_query:
-        query_clean = search_query.strip().upper().replace(" ", "")
-        
-        # 1. Exact match lookup
-        target_code = None
-        if query_clean in catalog:
-            target_code = query_clean
+    if submit_btn:
+        st.session_state.feedback_message = None
+        if not course_code_input:
+            st.session_state.feedback_message = ("warning", "Please enter a course code.")
         else:
-            # 2. Fuzzy search by code prefix or title substring
-            for c_code, c_meta in catalog.items():
-                if query_clean == c_code.replace("_", "") or search_query.strip().lower() in c_meta["title"].lower():
-                    target_code = c_code
-                    break
-        
-        if target_code:
-            already_in_holding = target_code in st.session_state.holding_zone
-            already_in_plan = any(target_code in clist for clist in st.session_state.plan.values())
+            # Capitalise and strip all spaces
+            clean_code = course_code_input.replace(" ", "").upper().strip()
 
-            if already_in_holding or already_in_plan:
-                st.session_state.search_msg = ("warning", f"**{target_code}** is already in your staging area or degree plan.")
+            c_info = lookup_course(clean_code)
+
+            if c_info:
+                already_in_holding = clean_code in st.session_state.holding_zone
+                already_in_plan = any(clean_code in clist for clist in st.session_state.plan.values())
+
+                if already_in_holding or already_in_plan:
+                    st.session_state.feedback_message = ("warning", f"**{clean_code}** is already in your holding zone or plan.")
+                else:
+                    st.session_state.holding_zone.append(clean_code)
+                    st.session_state.feedback_message = ("success", f"Added **{clean_code}** - {c_info['title']} to Holding Zone!")
             else:
-                st.session_state.holding_zone.append(target_code)
-                meta = catalog[target_code]
-                st.session_state.search_msg = ("success", f"Added **{target_code}** ({meta['title']}) to Holding Zone!")
-        else:
-            st.session_state.search_msg = ("error", f"Could not find course '{search_query}'. Ensure the code is correct.")
+                st.session_state.feedback_message = ("error", f"Could not find course '{clean_code}'. Ensure the code is correct.")
         st.rerun()
 
-    # Display feedback message if present
-    if st.session_state.search_msg:
-        msg_type, msg_text = st.session_state.search_msg
+    # Display feedback message
+    if st.session_state.feedback_message:
+        msg_type, msg_text = st.session_state.feedback_message
         if msg_type == "success":
             st.success(msg_text)
         elif msg_type == "warning":
             st.warning(msg_text)
         else:
             st.error(msg_text)
-        st.session_state.search_msg = None
+        st.session_state.feedback_message = None
 
     st.divider()
     st.header("2. Degree Structure")
@@ -370,26 +394,25 @@ with st.sidebar:
     include_t3 = st.checkbox("Include Trimester 3 (Summer)", value=True)
 
     st.divider()
-    # Live summary counters
     total_planned = sum(len(c) for c in st.session_state.plan.values())
     total_cp = sum(
-        int(catalog.get(c, {}).get("credit_points", 10) or 10)
+        int((catalog.get(c) or lookup_course(c) or {}).get("credit_points", 10) or 10)
         for clist in st.session_state.plan.values() for c in clist
     )
     st.metric("Total Courses Planned", f"{total_planned}")
     st.metric("Total Credit Points", f"{total_cp} CP")
 
-    if st.button("🗑️ Clear Entire Plan", use_container_width=True):
+    if st.button("🗑️ Reset Entire Plan", use_container_width=True):
         st.session_state.plan = {}
         st.session_state.holding_zone = []
         st.session_state.selected_course = None
         st.rerun()
 
 # -----------------------------------------------------------------------------
-# 7. HTML, CSS & JAVASCRIPT BUILDER
+# 7. HTML, CSS & JS COMPONENT BUILDER
 # -----------------------------------------------------------------------------
 def get_faculty_color(group_name: str) -> str:
-    """Distinctive color palette aligned with Griffith faculties."""
+    """Colors aligned with Griffith academic groups."""
     g = group_name.lower()
     if "health" in g:
         return "#00897b"  # Teal / Emerald
@@ -403,7 +426,7 @@ def get_faculty_color(group_name: str) -> str:
 
 def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, selected_code, warnings_dict):
     trimesters = [1, 2, 3] if include_t3 else [1, 2]
-    selected_meta = catalog_dict.get(selected_code) if selected_code else None
+    selected_meta = catalog_dict.get(selected_code) or (lookup_course(selected_code) if selected_code else None)
 
     html = """
     <style>
@@ -415,14 +438,18 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         --text-color: #f7f9fa;
     }
 
-    /* Remove scrollbars completely */
+    /* Completely eliminate all scrollbars */
     html, body {
         font-family: var(--font-family);
         color: var(--text-color);
         background: transparent;
         margin: 0;
         padding: 0;
-        overflow: hidden;
+        overflow: hidden !important;
+    }
+
+    * {
+        box-sizing: border-box;
     }
 
     .planner-box {
@@ -432,7 +459,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         padding: 16px 20px;
         box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
         margin-bottom: 20px;
-        box-sizing: border-box;
+        overflow: visible !important;
     }
 
     .section-title {
@@ -553,14 +580,15 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         background: rgba(0, 0, 0, 0.25);
         border: 1px dashed var(--border-color);
         border-radius: 8px;
+        overflow: visible !important;
     }
 
-    /* Degree Progression Matrix */
+    /* Progression Matrix */
     .year-container {
         margin-top: 14px;
         border: 1px solid var(--border-color);
         border-radius: 8px;
-        overflow: hidden;
+        overflow: visible !important;
     }
 
     .year-heading {
@@ -576,6 +604,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         display: flex;
         width: 100%;
         background: rgba(0, 0, 0, 0.15);
+        overflow: visible !important;
     }
 
     .trim-col {
@@ -583,6 +612,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         border-right: 1px solid var(--border-color);
         padding: 12px;
         box-sizing: border-box;
+        overflow: visible !important;
     }
 
     .trim-col:last-child {
@@ -600,7 +630,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         padding-bottom: 5px;
     }
 
-    /* Slot Target Buttons (Dynamic N + 1 up to 7) */
+    /* Dynamic Slot Target: N + 1 up to 7 max */
     .slot-target {
         border: 1.5px dashed rgba(255, 255, 255, 0.2);
         border-radius: 6px;
@@ -640,17 +670,17 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         <div class="section-title">
             <span>📥 Course Holding Zone</span>
             <span style="font-size: 11px; font-weight: normal; color: #a4b0be;">
-                Selected: <b style="color: #2ed573;">""" + (selected_code if selected_code else "None (Click a course to arm placement)") + """</b>
+                Selected: <b style="color: #2ed573;">""" + (selected_code if selected_code else "None (Click course to select)") + """</b>
             </span>
         </div>
         <div class="holding-grid">
     """
 
     if not holding_zone:
-        html += "<div style='color: rgba(255,255,255,0.4); font-size: 12px; grid-column: 1/-1;'>No courses in holding zone. Search for a course code in the sidebar to add one.</div>"
+        html += "<div style='color: rgba(255,255,255,0.4); font-size: 12px; grid-column: 1/-1;'>No courses in holding zone. Add a course from the sidebar to begin planning.</div>"
 
     for code in holding_zone:
-        info = catalog_dict.get(code, {"title": code, "credit_points": "10", "offerings": [], "prereqs": [], "coreqs": [], "group": ""})
+        info = catalog_dict.get(code) or lookup_course(code) or {"title": code, "credit_points": "10", "offerings": [], "prereqs": [], "coreqs": [], "group": ""}
         bg = get_faculty_color(info.get("group", ""))
         is_sel = "is-selected" if code == selected_code else ""
 
@@ -678,7 +708,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
     </div>
     """
 
-    # Year & Trimesters Progression Matrix
+    # Progression Matrix
     html += "<div class='planner-box'>"
     html += "<div class='section-title'>📅 Degree Progression Matrix</div>"
 
@@ -691,10 +721,10 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         for tr in trimesters:
             scheduled = plan.get((yr, tr), [])
             n_courses = len(scheduled)
-            cp_sum = sum(int(catalog_dict.get(c, {}).get("credit_points", 10) or 10) for c in scheduled)
+            cp_sum = sum(int((catalog_dict.get(c) or lookup_course(c) or {}).get("credit_points", 10) or 10) for c in scheduled)
             t_title = f"Trimester {tr}" if tr in [1, 2] else "Trimester 3 (Summer)"
 
-            # Check if currently armed/selected course is offered in this trimester
+            # Check if armed course is available in this trimester
             is_valid_term = is_course_offered_in_term(selected_meta, tr) if selected_meta else False
 
             html += f"""
@@ -705,9 +735,9 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                 </div>
             """
 
-            # Render Scheduled Course Cards
+            # Render Scheduled Cards
             for c in scheduled:
-                c_data = catalog_dict.get(c, {"title": c, "credit_points": "10", "offerings": [], "group": ""})
+                c_data = catalog_dict.get(c) or lookup_course(c) or {"title": c, "credit_points": "10", "offerings": [], "group": ""}
                 bg = get_faculty_color(c_data.get("group", ""))
                 is_sel = "is-selected" if c == selected_code else ""
                 warns = warnings_dict.get(c, [])
@@ -730,7 +760,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                 </div>
                 """
 
-            # Dynamic N + 1 Slot Target: Show exactly 1 target slot if n < 7, else hide it
+            # N + 1 Dynamic Target Slot (Max 7 courses per trimester)
             if n_courses < 7:
                 if selected_code:
                     if is_valid_term:
@@ -739,7 +769,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                         slot_action = f"onclick=\"onSlotClick({yr}, {tr})\""
                     else:
                         slot_class = "slot-target slot-disabled"
-                        slot_label = f"🚫 Not Offered in T{tr}"
+                        slot_label = f"🚫 {selected_code} Not Offered in T{tr}"
                         slot_action = ""
                 else:
                     slot_class = "slot-target"
@@ -815,9 +845,8 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
     return html
 
 # -----------------------------------------------------------------------------
-# 8. MAIN INTERFACE RENDER
+# 8. MAIN VIEW
 # -----------------------------------------------------------------------------
-# Header matching timetablegenWEB title styling
 render_title_html = """
 <div style="display: flex; align-items: center; margin-bottom: 0.8rem;">
     <span style="font-size: 2.2rem; margin-right: 8px;">🎓</span>
@@ -825,7 +854,7 @@ render_title_html = """
 </div>
 """
 st.markdown(render_title_html, unsafe_allow_html=True)
-st.caption("Interactively build your degree path across trimesters. Search a course code on the left to add it, click to select, and place it into valid open trimesters.")
+st.caption("Plan your study terms, check prerequisites, and schedule your degree path. Add a course on the left to get started.")
 
 # Validation warning alert banner
 if plan_warnings:
@@ -836,11 +865,11 @@ if plan_warnings:
 elif st.session_state.plan:
     st.success("✅ All scheduled courses satisfy prerequisite, corequisite, and offering constraints.")
 
-# Calculate frame height based on maximum scheduled load per trimester to avoid scrollbars
+# Compute frame height dynamically to completely eliminate scrollbars
 max_in_any_trim = max([len(v) for v in st.session_state.plan.values()] + [1])
 courses_render_factor = max_in_any_trim if max_in_any_trim == 7 else (max_in_any_trim + 1)
-year_block_height = 45 + (courses_render_factor * 85)
-calc_height = 240 + (num_years * year_block_height)
+year_block_height = 50 + (courses_render_factor * 85)
+calc_height = 250 + (num_years * year_block_height)
 
 planner_html = build_planner_html(
     holding_zone=st.session_state.holding_zone,
