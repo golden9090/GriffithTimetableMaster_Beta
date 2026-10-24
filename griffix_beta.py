@@ -146,16 +146,67 @@ def load_full_catalog():
 
     return catalog
 
+def format_offerings_label(offerings_list):
+    """Converts ['Trimester 2', 'Summer Semester'] -> 'T2/T3'."""
+    if not offerings_list:
+        return "TBA"
+    formatted = []
+    offs_lower = [str(o).lower() for o in offerings_list]
+    if any("trimester 1" in o or "t1" in o for o in offs_lower):
+        formatted.append("T1")
+    if any("trimester 2" in o or "t2" in o for o in offs_lower):
+        formatted.append("T2")
+    if any("summer" in o or "trimester 3" in o or "t3" in o for o in offs_lower):
+        formatted.append("T3")
+    return "/".join(formatted) if formatted else "/".join([str(o) for o in offerings_list])
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_full_catalog():
+    """Fetches all courses from Griffith search API with standard browser headers."""
+    catalog = {}
+    url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&num_ranks=3000&start_rank=1&sort=metafborderna"
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*'
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code == 200:
+            data = resp.json()
+            results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+            for item in results:
+                meta = item.get("listMetadata", {})
+                cat_numbers = meta.get("categoryNumber", [])
+                if not cat_numbers:
+                    continue
+                code = str(cat_numbers[0]).replace(" ", "").upper().strip()
+                title = meta.get("title", [code])[0]
+                cp = meta.get("creditPoints", ["10"])[0]
+                desc = meta.get("description", [""])[0] or ""
+                offerings = meta.get("nextOffering", [])
+                career = meta.get("academicCareerName", ["Undergraduate"])[0]
+                group = meta.get("academicGrpDescription", ["Other"])[0]
+
+                catalog[code] = {
+                    "code": code,
+                    "title": title,
+                    "credit_points": cp,
+                    "description": desc,
+                    "offerings": list(set(offerings)),
+                    "career": career,
+                    "group": group,
+                    "prereqs": extract_prereqs(desc),
+                    "coreqs": extract_coreqs(desc),
+                    "incompatibles": extract_incompatibles(desc)
+                }
+    except Exception as e:
+        print(f"Catalog fetch error: {e}")
+    return catalog
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalog_offerings: list):
-    """
-    Fetches structured metadata and requisites from the Curriculum API.
-    Term mapping: 3261 (T1), 3265 (T2), 3268 (T3/Summer).
-    Falls back to prior year if the current/requested year is unreleased.
-    """
     subscription_key = "b8ae10d400ef42f89a127abe4a760e46"
     
-    # 1. Determine earliest offered trimester
     offs_lower = [str(o).lower() for o in catalog_offerings]
     if any("trimester 1" in o or "t1" in o for o in offs_lower):
         primary_term = "3261"
@@ -168,13 +219,12 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
     terms_to_try = [primary_term] + [t for t in ["3261", "3265", "3268"] if t != primary_term]
 
-    # 2. Year determination: Cap future selections to the current year
     current_year = datetime.now().year
     search_year = min(selected_year, current_year)
     years_to_try = [search_year, search_year - 1]
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
         "Ocp-Apim-Subscription-Key": subscription_key,
         "Origin": "https://my.griffith.edu.au",
         "Referer": "https://my.griffith.edu.au/"
@@ -189,7 +239,6 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     data = resp.json()
                     mapped = data.get("mappedData", {}).get("components", {})
 
-                    # Extract requisites from structured crseRequiste component
                     prereqs, coreqs, incompatibles = [], [], []
                     req_obj = mapped.get("crseRequiste", {}).get("value", {})
                     if isinstance(req_obj, dict):
@@ -204,7 +253,6 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                             elif "ANTI" in rtype:
                                 incompatibles.extend(codes)
 
-                    # Check for unstructured other requisites
                     other_req = mapped.get("crseOthrRequiste", {}).get("value")
                     if other_req and isinstance(other_req, str):
                         prereqs.extend(extract_course_codes(other_req))
@@ -212,6 +260,21 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     prereqs = [p for p in dict.fromkeys(prereqs) if p != clean_code]
                     coreqs = [c for c in dict.fromkeys(coreqs) if c != clean_code]
                     incompatibles = [i for i in dict.fromkeys(incompatibles) if i != clean_code]
+
+                    # Extract offerings from curriculum API if catalog had none
+                    final_offerings = list(catalog_offerings)
+                    if not final_offerings:
+                        tri_val = mapped.get("crseTri", {}).get("value", [])
+                        if isinstance(tri_val, list): final_offerings.extend(tri_val)
+                        elif isinstance(tri_val, str): final_offerings.append(tri_val)
+
+                        ofrg_tbl = mapped.get("crseOfrg2CrseOfrg", {}).get("value", {})
+                        if isinstance(ofrg_tbl, dict):
+                            for row in ofrg_tbl.get("rows", []):
+                                is_y = row.get("crseOfrg2Ofrd", {}).get("key") == "Y" or row.get("crseOfrg2Ofrd", {}).get("value") == "YES"
+                                p_str = row.get("crseOfrg2TchngPeriod", {}).get("value")
+                                if is_y and p_str and p_str not in final_offerings:
+                                    final_offerings.append(p_str)
 
                     title = data.get("name") or mapped.get("crseShrtDescr", {}).get("value") or clean_code
                     cp_val = mapped.get("crseAwrdCrdtPnts", {}).get("value", {})
@@ -223,7 +286,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                         "title": title,
                         "credit_points": cp,
                         "description": desc,
-                        "offerings": catalog_offerings,
+                        "offerings": list(dict.fromkeys(final_offerings)),
                         "career": data.get("subtype", "Undergraduate"),
                         "group": data.get("orgParent", "Other"),
                         "prereqs": prereqs,
@@ -235,11 +298,9 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
     return None
 
-# --- INITIALIZE CATALOG FIRST ---
 catalog = load_full_catalog()
 
 def lookup_course(clean_code: str, selected_year: int = None):
-    """Finds course using the cached 3000-catalog, then retrieves requisites via the Curriculum API."""
     if selected_year is None:
         selected_year = datetime.now().year
 
@@ -281,8 +342,9 @@ def term_index(year: int, trimester: int) -> int:
     return (year - 1) * 3 + trimester
 
 def validate_plan(plan: dict, catalog_dict: dict):
-    warnings = {}       # {course_code: [warning_msg, ...]}
-    placed_coords = {}  # {course_code: (year, trimester)}
+    warnings = {}    # {course_code: [warning_msg, ...]}
+    satisfied = {}   # {course_code: [satisfied_msg, ...]}
+    placed_coords = {}
 
     for (yr, tr), courses in plan.items():
         for c in courses:
@@ -294,6 +356,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
         current_rank = term_index(yr, tr)
         for c in courses:
             c_warns = []
+            c_sats = []
             info = catalog_dict.get(c) or lookup_course(c) or {}
             prereqs = info.get("prereqs", [])
             coreqs = info.get("coreqs", [])
@@ -303,22 +366,26 @@ def validate_plan(plan: dict, catalog_dict: dict):
             if not is_course_offered_in_term(info, tr):
                 c_warns.append(f"Not usually offered in Trimester {tr}")
 
-            # 2. Prerequisite Check (Must occur strictly earlier)
+            # 2. Prerequisite Check
             for p in prereqs:
                 if p not in placed_coords:
                     c_warns.append(f"Missing Prerequisite: {p}")
                 else:
                     p_yr, p_tr = placed_coords[p]
-                    if term_index(p_yr, p_tr) >= current_rank:
+                    if term_index(p_yr, p_tr) < current_rank:
+                        c_sats.append(f"Prerequisite satisfied: {p} (completed in Year {p_yr} T{p_tr})")
+                    else:
                         c_warns.append(f"Prereq {p} must be completed before Year {yr} T{tr}")
 
-            # 3. Corequisite Check (Must occur in same or earlier trimester)
+            # 3. Corequisite Check
             for cr in coreqs:
                 if cr not in placed_coords:
                     c_warns.append(f"Missing Corequisite: {cr}")
                 else:
                     cr_yr, cr_tr = placed_coords[cr]
-                    if term_index(cr_yr, cr_tr) > current_rank:
+                    if term_index(cr_yr, cr_tr) <= current_rank:
+                        c_sats.append(f"Corequisite satisfied: {cr} (enrolled Year {cr_yr} T{cr_tr})")
+                    else:
                         c_warns.append(f"Coreq {cr} scheduled after Year {yr} T{tr}")
 
             # 4. Incompatibility Check
@@ -328,10 +395,12 @@ def validate_plan(plan: dict, catalog_dict: dict):
 
             if c_warns:
                 warnings[c] = c_warns
+            if c_sats:
+                satisfied[c] = c_sats
 
-    return warnings
+    return warnings, satisfied
 
-plan_warnings = validate_plan(st.session_state.plan, catalog)
+plan_warnings, plan_satisfied = validate_plan(st.session_state.plan, catalog)
 
 # -----------------------------------------------------------------------------
 # 5. STREAMLIT-JS ACTION BRIDGE
@@ -628,8 +697,9 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
     }
 
     .warning-pill {
-        background: #ff4757;
-        color: #ffffff;
+        background: rgba(255, 71, 87, 0.2);
+        border: 1px solid #ff4757;
+        color: #ff6b81;
         font-size: 9.5px;
         padding: 3px 6px;
         border-radius: 4px;
@@ -638,19 +708,18 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         font-weight: 700;
     }
 
-    /* Holding Grid */
-    .holding-grid {
-        display: grid;
-        grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
-        gap: 10px;
-        min-height: 60px;
-        padding: 12px;
-        background: rgba(0, 0, 0, 0.25);
-        border: 1px dashed var(--border-color);
-        border-radius: 8px;
-        overflow: visible !important;
+    .success-pill {
+        background: rgba(46, 213, 115, 0.2);
+        border: 1px solid #2ed573;
+        color: #2ed573;
+        font-size: 9.5px;
+        padding: 2px 6px;
+        border-radius: 4px;
+        margin-top: 5px;
+        display: inline-block;
+        font-weight: 700;
     }
-
+    
     /* Progression Matrix */
     .year-container {
         margin-top: 14px;
@@ -754,7 +823,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
 
         pr_text = f"Pre: {', '.join(info['prereqs'])}" if info["prereqs"] else "No Prereqs"
         cr_text = f" | Co: {', '.join(info['coreqs'])}" if info["coreqs"] else ""
-        offs = "/".join([o.replace("Trimester ", "T").replace("Summer Semester", "T3") for o in info.get("offerings", [])])
+        offs = format_offerings_label(info.get("offerings", []))
 
         html += f"""
         <div class="course-card {is_sel}" style="background-color: {bg};" onclick="onCourseClick('{code}')">
@@ -765,7 +834,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
             <div class="card-title" title="{info['title']}">{info['title']}</div>
             <div class="badges-row">
                 <span class="badge-pill">{info.get('credit_points', '10')} CP</span>
-                <span class="badge-pill">{offs or 'TBA'}</span>
+                <span class="badge-pill">{offs}</span>
             </div>
             <div style="font-size: 9px; opacity: 0.85; margin-top: 5px;">{pr_text}{cr_text}</div>
         </div>
@@ -809,10 +878,15 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                 bg = string_to_pastel_hex(c)
                 is_sel = "is-selected" if c == selected_code else ""
                 warns = warnings_dict.get(c, [])
+                sats = st.session_state.get('plan_satisfied_dict', {}).get(c, [])
 
-                warn_snippet = ""
+                badges_html = ""
                 if warns:
-                    warn_snippet = f"<div class='warning-pill' title='{'; '.join(warns)}'>⚠️ {warns[0]}</div>"
+                    badges_html += f"<div class='warning-pill' title='{'; '.join(warns)}'>⚠️ {warns[0]}</div>"
+                if sats:
+                    badges_html += f"<div class='success-pill' title='{'; '.join(sats)}'>✅ {sats[0]}</div>"
+
+                offs = format_offerings_label(c_data.get("offerings", []))
 
                 html += f"""
                 <div class="course-card {is_sel}" style="background-color: {bg};" onclick="onCourseClick('{c}')">
@@ -823,8 +897,9 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                     <div class="card-title" title="{c_data['title']}">{c_data['title']}</div>
                     <div class="badges-row">
                         <span class="badge-pill">{c_data.get('credit_points', '10')} CP</span>
+                        <span class="badge-pill">{offs}</span>
                     </div>
-                    {warn_snippet}
+                    {badges_html}
                 </div>
                 """
 
@@ -924,12 +999,21 @@ render_title_html = """
 st.markdown(render_title_html, unsafe_allow_html=True)
 st.caption("Plan your study terms, check prerequisites, and schedule your degree path. Add a course on the left to get started.")
 
-# Validation warning alert banner
-if plan_warnings:
-    with st.expander(f"⚠️ Degree Plan Warnings ({len(plan_warnings)} issues detected)", expanded=True):
-        for c, issues in plan_warnings.items():
-            for iss in issues:
-                st.error(f"**{c}**: {iss}")
+st.session_state['plan_satisfied_dict'] = plan_satisfied
+
+# Validation & Satisfied Requisites Report
+if plan_warnings or plan_satisfied:
+    with st.expander(f"📋 Course Requisites & Status ({len(plan_warnings)} warnings, {len(plan_satisfied)} satisfied)", expanded=True if plan_warnings else False):
+        if plan_warnings:
+            st.markdown("##### ⚠️ Warnings")
+            for c, issues in plan_warnings.items():
+                for iss in issues:
+                    st.error(f"**{c}**: {iss}")
+        if plan_satisfied:
+            st.markdown("##### ✅ Satisfied Requisites")
+            for c, sats in plan_satisfied.items():
+                for sat_msg in sats:
+                    st.success(f"**{c}**: {sat_msg}")
 elif st.session_state.plan:
     st.success("✅ All scheduled courses satisfy prerequisite, corequisite, and offering constraints.")
 
