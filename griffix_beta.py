@@ -147,7 +147,6 @@ def load_full_catalog():
     return catalog
 
 @st.cache_data(ttl=86400, show_spinner=False)
-@st.cache_data(ttl=86400, show_spinner=False)
 def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalog_offerings: list):
     """
     Fetches structured metadata and requisites from the Curriculum API.
@@ -210,7 +209,6 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     if other_req and isinstance(other_req, str):
                         prereqs.extend(extract_course_codes(other_req))
 
-                    # Deduplicate while preserving order
                     prereqs = [p for p in dict.fromkeys(prereqs) if p != clean_code]
                     coreqs = [c for c in dict.fromkeys(coreqs) if c != clean_code]
                     incompatibles = [i for i in dict.fromkeys(incompatibles) if i != clean_code]
@@ -218,7 +216,6 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     title = data.get("name") or mapped.get("crseShrtDescr", {}).get("value") or clean_code
                     cp_val = mapped.get("crseAwrdCrdtPnts", {}).get("value", {})
                     cp = str(cp_val.get("value", 10) if isinstance(cp_val, dict) else data.get("unitsMinimum", 10))
-
                     desc = mapped.get("crseDescr", {}).get("value", "")
 
                     return {
@@ -238,6 +235,9 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
     return None
 
+# --- INITIALIZE CATALOG FIRST ---
+catalog = load_full_catalog()
+
 def lookup_course(clean_code: str, selected_year: int = None):
     """Finds course using the cached 3000-catalog, then retrieves requisites via the Curriculum API."""
     if selected_year is None:
@@ -253,7 +253,9 @@ def lookup_course(clean_code: str, selected_year: int = None):
 
     if catalog_entry:
         return catalog_entry
-    return None# -----------------------------------------------------------------------------
+    return None
+    
+# -----------------------------------------------------------------------------
 # 3. OFFERING AVAILABILITY CHECKER
 # -----------------------------------------------------------------------------
 def is_course_offered_in_term(c_info: dict, trimester: int) -> bool:
