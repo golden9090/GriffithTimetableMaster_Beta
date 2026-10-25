@@ -6,6 +6,7 @@ import re
 import hashlib
 import colorsys
 import difflib
+import urllib.parse
 from datetime import datetime
 
 st.warning("**IMPORTANT**: THIS SITE IS A BETA VERSION OF GRIFFIX FEATURES, AND ONLY INCLUDES **EXPERIMENTAL FEATURES UNDERGOING TESTING**. ACCESS THE OFFICIAL VERSION OF GRIFFIX [HERE](https://griffix.streamlit.app)")
@@ -121,11 +122,11 @@ def format_offerings_label(offerings_list):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_full_catalog():
-    """Fetches all courses from Griffith search API with standard browser headers."""
+    """Fetches all courses from Griffith search API."""
     catalog = {}
     url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&num_ranks=3000&start_rank=1&sort=metafborderna"
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
         'Accept': 'application/json, text/plain, */*'
     }
     try:
@@ -183,7 +184,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
     years_to_try = [search_year, search_year - 1]
 
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)",
         "Ocp-Apim-Subscription-Key": subscription_key,
         "Origin": "https://my.griffith.edu.au",
         "Referer": "https://my.griffith.edu.au/"
@@ -277,68 +278,124 @@ def lookup_course(clean_code: str, selected_year: int = None):
 # -----------------------------------------------------------------------------
 # 2B. LIVE DEGREE SEARCH & CURRICULUM RULES PARSER
 # -----------------------------------------------------------------------------
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_degrees_list():
-    """Fetches degrees live from Griffith degrees search endpoint."""
-    url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=500&start_rank=1&sort=metafborderna"
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
-        'Accept': 'application/json, text/plain, */*'
-    }
+def get_fallback_degrees():
+    """Provides fallback degree programs in case of connection limits."""
+    return [
+        {"code": "1031", "title": "Bachelor of Biomedical Science", "campuses": ["Brisbane South", "Nathan"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate"},
+        {"code": "1094", "title": "Bachelor of Biomedical Science", "campuses": ["Gold Coast"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate"},
+        {"code": "1280", "title": "Bachelor of Medical Science", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1"], "duration_years": 2, "career": "Undergraduate"},
+        {"code": "1162", "title": "Bachelor of Nursing", "campuses": ["Gold Coast", "Logan", "Brisbane South"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate"},
+        {"code": "1577", "title": "Bachelor of Dental Health Science", "campuses": ["Gold Coast"], "intakes": ["Trimester 1"], "duration_years": 3, "career": "Undergraduate"},
+        {"code": "1590", "title": "Bachelor of Physiotherapy (Honours)", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1"], "duration_years": 4, "career": "Undergraduate"},
+        {"code": "2004", "title": "Bachelor of Psychological Science (Honours)", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1"], "duration_years": 1, "career": "Undergraduate"},
+        {"code": "1012", "title": "Bachelor of Psychological Science", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1", "Trimester 2", "Trimester 3"], "duration_years": 3, "career": "Undergraduate"},
+        {"code": "1619", "title": "Bachelor of Laws (Honours)", "campuses": ["Gold Coast", "Brisbane City"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 4, "career": "Undergraduate"},
+        {"code": "1662", "title": "Bachelor of Occupational Therapy (Honours)", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1"], "duration_years": 4, "career": "Undergraduate"},
+        {"code": "1533", "title": "Bachelor of Paramedicine", "campuses": ["Gold Coast"], "intakes": ["Trimester 1"], "duration_years": 3, "career": "Undergraduate"},
+        {"code": "1546", "title": "Bachelor of Engineering (Honours)", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 4, "career": "Undergraduate"},
+        {"code": "1632", "title": "Bachelor of Business", "campuses": ["Online", "Gold Coast", "Brisbane City", "Brisbane South"], "intakes": ["Trimester 1", "Trimester 2", "Trimester 3"], "duration_years": 3, "career": "Undergraduate"},
+        {"code": "1354", "title": "Bachelor of Midwifery", "campuses": ["Logan"], "intakes": ["Trimester 1"], "duration_years": 3, "career": "Undergraduate"},
+        {"code": "1540", "title": "Bachelor of Biomolecular Science (Honours)", "campuses": ["Brisbane South"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 4, "career": "Undergraduate"}
+    ]
+
+def parse_degree_results(results):
     degrees = []
-    try:
-        resp = requests.get(url, headers=headers, timeout=20)
-        if resp.status_code == 200:
-            data = resp.json()
-            results = data.get("response", {}).get("resultPacket", {}).get("results", [])
-            for r in results:
-                meta = r.get("listMetadata", {})
-                codes = meta.get("code", []) or [r.get("title", "")]
-                code = str(codes[0]).strip() if codes else ""
-                title = meta.get("title", [r.get("title", "")])[0]
-                campuses = meta.get("campusName", [])
-                intakes = meta.get("intakesName", [])
-                durations = meta.get("duration", [])
-                career = meta.get("academicCareer", ["Undergraduate"])[0]
+    for r in results:
+        meta = r.get("listMetadata", {})
+        codes = meta.get("code", [])
+        code = str(codes[0]).strip() if codes else ""
+        if not code:
+            url = r.get("liveUrl", "")
+            match = re.search(r'-([0-9]{4})\b', url)
+            if match:
+                code = match.group(1)
+            else:
+                continue
 
-                # Parse duration in years
-                years = 3
-                for d in durations:
-                    d_str = str(d).strip()
-                    if d_str.isdigit() and 1 <= int(d_str) <= 6:
-                        years = int(d_str)
-                        break
-                    match = re.search(r'(\d+)\s*years?', d_str, re.I)
-                    if match:
-                        years = int(match.group(1))
-                        break
+        title_list = meta.get("title", [])
+        title = title_list[0] if title_list else r.get("title", code)
+        campuses = meta.get("campusName", [])
+        intakes = meta.get("intakesName", [])
+        durations = meta.get("duration", [])
+        career = meta.get("academicCareer", ["Undergraduate"])[0]
 
-                degrees.append({
-                    "code": code,
-                    "title": title,
-                    "campuses": list(dict.fromkeys(campuses)),
-                    "intakes": list(dict.fromkeys(intakes)),
-                    "duration_years": years,
-                    "durations_raw": durations,
-                    "career": career
-                })
-    except Exception as e:
-        print(f"Error fetching degrees: {e}")
+        years = 3
+        for d in durations:
+            d_str = str(d).strip()
+            if d_str.isdigit() and 1 <= int(d_str) <= 6:
+                years = int(d_str)
+                break
+            match = re.search(r'(\d+)\s*years?', d_str, re.I)
+            if match:
+                years = int(match.group(1))
+                break
+
+        degrees.append({
+            "code": code,
+            "title": title,
+            "campuses": list(dict.fromkeys(campuses)),
+            "intakes": list(dict.fromkeys(intakes)),
+            "duration_years": years,
+            "durations_raw": durations,
+            "career": career
+        })
     return degrees
 
-def search_degrees(query: str, degrees: list):
-    """Searches degrees using keyword substring and fuzzy matching for typos."""
-    if not query:
+@st.cache_data(ttl=86400, show_spinner=False)
+def fetch_all_degrees_catalog():
+    """Fetches full degree catalog using required cohort parameters."""
+    headers = {
+        'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
+        'Accept': 'application/json, text/plain, */*'
+    }
+    urls = [
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&sort=metafborderna&smeta_intlCohortYears_orsand=2026&smeta_intlCohortYears_orsand=2027&smeta_intlCohortYears_orsand=2028",
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&sort=metafborderna&query=!padrenull",
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&sort=metafborderna"
+    ]
+    for url in urls:
+        try:
+            resp = requests.get(url, headers=headers, timeout=12)
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+                parsed = parse_degree_results(results)
+                if parsed:
+                    return parsed
+        except Exception:
+            continue
+    return get_fallback_degrees()
+
+def query_degrees_live(query_str: str):
+    """Executes a direct live keyword search against the Griffith degrees endpoint."""
+    if not query_str or len(query_str.strip()) < 2:
         return []
+    clean_q = urllib.parse.quote(query_str.strip())
+    url = f"https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=40&query={clean_q}&smeta_intlCohortYears_orsand=2026&smeta_intlCohortYears_orsand=2027&smeta_intlCohortYears_orsand=2028"
+    headers = {
+        'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
+        'Accept': 'application/json, text/plain, */*'
+    }
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code == 200:
+            data = resp.json()
+            return parse_degree_results(data.get("response", {}).get("resultPacket", {}).get("results", []))
+    except Exception as e:
+        print(f"Live degree query error: {e}")
+    return []
+
+def search_degrees(query: str, degrees: list):
+    """Performs token and fuzzy match against a degree catalog."""
+    if not query:
+        return degrees[:20]
     q = query.strip().lower()
     q_words = q.split()
 
-    # Exact token / substring matches
     direct = [d for d in degrees if all(w in f"{d['title']} {d['code']}".lower() for w in q_words)]
     if direct:
         return direct
 
-    # Fuzzy match fallback (handles typos like 'nedical sciecne')
     scored = []
     for d in degrees:
         target = f"{d['title']} {d['code']}".lower()
@@ -346,35 +403,51 @@ def search_degrees(query: str, degrees: list):
         word_ratios = [max(difflib.SequenceMatcher(None, qw, tw).ratio() for tw in target.split()) for qw in q_words]
         avg_word_ratio = sum(word_ratios) / len(word_ratios) if word_ratios else 0
         best_score = max(full_ratio, avg_word_ratio)
-        if best_score > 0.58:
+        if best_score > 0.50:
             scored.append((best_score, d))
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [d for _, d in scored[:15]]
+    return [d for _, d in scored[:20]]
+
+def get_matching_degrees(query: str):
+    """Combines live Funnelback search results with fuzzy local catalog matching."""
+    if not query:
+        return []
+    catalog_list = fetch_all_degrees_catalog()
+    local_matches = search_degrees(query, catalog_list)
+    live_matches = query_degrees_live(query)
+
+    combined = []
+    seen = set()
+    for d in live_matches + local_matches:
+        if d['code'] not in seen:
+            seen.add(d['code'])
+            combined.append(d)
+    return combined
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_degree_program_rules(degree_code: str):
-    """Fetches program rules for a degree code from the Curriculum API."""
+    """Fetches program rules from Curriculum API with 2027/2026 fallback."""
     subscription_key = "5145ba30d5734d4cb6047c47527ef930"
-    url = f"https://api-lt.griffith.edu.au/curriculumapi/v1/programrules/degree/{degree_code}/2027/Trimester%201?subscription-key={subscription_key}"
+    years = [2027, 2026]
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "User-Agent": "Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)",
         "Ocp-Apim-Subscription-Key": subscription_key,
         "Origin": "https://my.griffith.edu.au",
         "Referer": "https://my.griffith.edu.au/"
     }
-    try:
-        resp = requests.get(url, headers=headers, timeout=15)
-        if resp.status_code == 200:
-            return resp.json()
-    except Exception as e:
-        print(f"Curriculum program rules error for {degree_code}: {e}")
+    for yr in years:
+        url = f"https://api-lt.griffith.edu.au/curriculumapi/v1/programrules/degree/{degree_code}/{yr}/Trimester%201?subscription-key={subscription_key}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=12)
+            if resp.status_code == 200:
+                data = resp.json()
+                if data and isinstance(data, dict) and "mappedData" in data:
+                    return data
+        except Exception:
+            continue
     return None
 
 def parse_degree_rules(rules_json, selected_intake="Trimester 1", campus_preference=None, study_mode="Full-time", fallback_duration=3):
-    """
-    Parses program rules JSON to extract core courses (with OR logic),
-    progression study plans, trimester 3 inclusion, and CP targets.
-    """
     core_courses = []
     include_t3 = False
     duration_years = fallback_duration
@@ -402,13 +475,12 @@ def parse_degree_rules(rules_json, selected_intake="Trimester 1", campus_prefere
             if "core" in str(item.get("title", "")).lower():
                 target_core_data = item.get("data", [])
                 break
-            # Check nested prescribed plans (e.g., campus specific in BMedSci)
             body_sub = item.get("body", [])
             for sub in body_sub:
                 prog_plan = sub.get("programPlan", {})
                 if prog_plan:
                     plan_name = sub.get("curriculumReference", {}).get("name", "")
-                    if campus_preference and campus_preference.lower() in plan_name.lower():
+                    if campus_preference and (campus_preference.lower() in plan_name.lower() or plan_name.lower() in campus_preference.lower()):
                         chosen_plan = prog_plan
                         break
                     elif not chosen_plan:
@@ -424,7 +496,6 @@ def parse_degree_rules(rules_json, selected_intake="Trimester 1", campus_prefere
                 break
         target_study_plan_comp = chosen_plan.get("progRuleStdyPlan", {})
 
-    # Extract core courses and detect OR groupings
     seen_codes = set()
     for entry in target_core_data:
         list_or = entry.get("listOr", [])
@@ -449,7 +520,6 @@ def parse_degree_rules(rules_json, selected_intake="Trimester 1", campus_prefere
                 "or_group": or_partners
             })
 
-    # Parse Study Plan progression for duration and trimester CP targets
     sp_items = target_study_plan_comp.get("studyPlanItems", [])
     matched_sp = None
     for sp in sp_items:
@@ -661,8 +731,7 @@ with st.sidebar:
             st.write("Search your degree to auto-load core courses and configure your degree structure:")
             deg_query = st.text_input("Degree Keyword", placeholder="e.g. Medical Science, Nursing, Business...", key="degree_search_input")
 
-            degrees_list = fetch_degrees_list()
-            matched_degs = search_degrees(deg_query, degrees_list) if deg_query else []
+            matched_degs = get_matching_degrees(deg_query) if deg_query else []
 
             if deg_query and not matched_degs:
                 st.caption("No matching degrees found. Try alternative keywords.")
@@ -1155,7 +1224,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         cr_text = f" | Co: {', '.join(info['coreqs'])}" if info["coreqs"] else ""
         offs = format_offerings_label(info.get("offerings", []))
 
-        # OR option badge
         or_badge = ""
         if code in course_or_map and course_or_map[code]:
             partner_str = ", ".join(course_or_map[code])
@@ -1198,7 +1266,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
             cp_sum = sum(int((catalog_dict.get(c) or lookup_course(c) or {}).get("credit_points", 10) or 10) for c in scheduled)
             t_title = f"Trimester {tr}" if tr in [1, 2] else "Trimester 3 (Summer)"
 
-            # Target CP (40 for Full-time, 20 for Part-time, unless accelerated plan provides specific CP)
             default_target = 20 if study_mode == "Part-time" else 40
             target_cp = target_cp_map.get((yr, tr), default_target)
             cp_label = f"{cp_sum}/{target_cp} CP"
@@ -1252,7 +1319,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                 </div>
                 """
 
-            # N + 1 Dynamic Target Slot (Max 7 courses per trimester)
             if n_courses < 7:
                 if selected_code:
                     if is_valid_term:
@@ -1350,7 +1416,6 @@ st.caption("Plan your study terms, check prerequisites, and schedule your degree
 
 st.session_state['plan_satisfied_dict'] = plan_satisfied
 
-# Validation & Satisfied Requisites Report
 if plan_warnings or plan_satisfied:
     with st.expander(f"📋 Course Requisites & Status ({len(plan_warnings)} warnings, {len(plan_satisfied)} satisfied)", expanded=True if plan_warnings else False):
         if plan_warnings:
@@ -1366,7 +1431,6 @@ if plan_warnings or plan_satisfied:
 elif st.session_state.plan:
     st.success("✅ All scheduled courses satisfy prerequisite, corequisite, and offering constraints.")
 
-# Compute frame height dynamically
 max_in_any_trim = max([len(v) for v in st.session_state.plan.values()] + [1])
 courses_render_factor = max_in_any_trim if max_in_any_trim == 7 else (max_in_any_trim + 1)
 year_block_height = 50 + (courses_render_factor * 85)
