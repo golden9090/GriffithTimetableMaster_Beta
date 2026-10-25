@@ -11,6 +11,8 @@ from datetime import datetime
 import os
 import difflib
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 
 st.warning("**IMPORTANT**: THIS SITE IS A BETA VERSION OF GRIFFIX FEATURES, AND ONLY INCLUDES **EXPERIMENTAL FEATURES UNDERGOING TESTING**. ACCESS THE OFFICIAL VERSION OF GRIFFIX [HERE](https://griffix.streamlit.app)")
 st.error("**WARNING**: THIS SITE DOES **NOT** SAVE WHAT YOU HAVE ON YOUR SCREEN AFTER YOU REFRESH OR CLOSE THE PAGE.")
@@ -156,27 +158,44 @@ def format_campuses_label(campuses_list) -> str:
     dedup = list(dict.fromkeys(clean))
     return ", ".join(dedup) if dedup else ""
 
+
 def get_campus_badge_data(campuses_list: list, home_campus: str = None) -> tuple[str, bool]:
     """
     Returns (campus_display_string, is_warning_mismatch).
-    Matches Nathan and Brisbane South (Nathan) identically.
-    Flags warning if the course does not offer the student's home campus.
+    - Online courses are NEVER flagged as a warning under any circumstance.
+    - Nathan and Brisbane South (Nathan) are normalized to the same campus.
+    - Flags a warning ONLY if a course has in-person offerings that omit the student's home campus.
     """
     if not campuses_list:
         return "", False
 
     camp_str = format_campuses_label(campuses_list)
-    if not camp_str or not home_campus:
-        return camp_str, False
+    if not camp_str:
+        return "", False
 
-    # Normalize both home campus and course campuses identically
-    norm_home = normalize_campus_name(home_campus).strip().lower()
     norm_course_camps = [normalize_campus_name(c).strip().lower() for c in campuses_list]
 
-    # Nathan and Brisbane South (Nathan) both normalize to 'brisbane south (nathan)'
-    has_home = any(norm_home == c or norm_home in c or c in norm_home for c in norm_course_camps)
+    # RULE 1: Online should NOT be flagged no matter the circumstance!
+    if any("online" in c for c in norm_course_camps):
+        return camp_str, False
 
+    if not home_campus:
+        return camp_str, False
+
+    norm_home = normalize_campus_name(home_campus).strip().lower()
+
+    # If student's home program is Online, do not flag
+    if "online" in norm_home:
+        return camp_str, False
+
+    # Check if home campus matches any course campus
+    # (Nathan and Brisbane South (Nathan) both normalize to 'brisbane south (nathan)')
+    has_home = any(norm_home == c or norm_home in c or c in norm_home for c in norm_course_camps)
     is_warning = not has_home
+
+    if is_warning:
+        print(f"[CAMPUS CHECK] ⚠️ Campus mismatch for course offering '{camp_str}' vs student home campus '{home_campus}'", flush=True)
+
     return camp_str, is_warning
 # -----------------------------------------------------------------------------
 # 3. REQUISITES & OFFERINGS PARSER (CP-AWARE & PROGRAM-AWARE)
@@ -497,13 +516,39 @@ def load_full_catalog():
     return catalog
 
 
-@st.cache_data(ttl=86400, show_spinner=False)
-def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalog_offerings: list):
+
+@st.cache_resource
+def get_http_session():
+    """Shared Keep-Alive HTTP session for fast pooled API requests."""
+    s = requests.Session()
+    adapter = requests.adapters.HTTPAdapter(pool_connections=20, pool_maxsize=20)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+@st.cache_resource
+def get_live_course_cache():
+    """Persistent RAM cache across reruns (stores dicts or 'NOT_FOUND')."""
+    return {}
+
+def _fetch_course_api_worker(http_session, clean_code: str, selected_year: int, catalog_offerings: list):
+    """Thread-safe worker (no st.* calls inside) to fetch Curriculum API metadata."""
     subscription_key = "b8ae10d400ef42f89a127abe4a760e46"
-    
-    # Try the selected year, then 2026, 2027, 2025
-    years_to_try = [selected_year, 2026, 2027, 2025]
-    years_to_try = list(dict.fromkeys([y for y in years_to_try if y]))
+
+    # Prioritize the trimester listed in catalog_offerings so Attempt #1 usually hits 200 OK
+    offs_lower = [str(o).lower() for o in (catalog_offerings or [])]
+    preferred_tris = []
+    if any("trimester 1" in o or "t1" in o for o in offs_lower):
+        preferred_tris.append("1")
+    if any("trimester 2" in o or "t2" in o for o in offs_lower):
+        preferred_tris.append("5")
+    if any("summer" in o or "trimester 3" in o or "t3" in o for o in offs_lower):
+        preferred_tris.append("8")
+    for t_dig in ["1", "5", "8"]:
+        if t_dig not in preferred_tris:
+            preferred_tris.append(t_dig)
+
+    years_to_try = list(dict.fromkeys([y for y in [selected_year, 2026, 2027, 2025] if y]))[:2]
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -514,13 +559,12 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
     for yr in years_to_try:
         yr_short = str(yr)[-2:]
-        # Correct PeopleSoft term codes for the specific year: T1=3{yy}1, T2=3{yy}5, T3=3{yy}8
-        terms_to_try = [f"3{yr_short}1", f"3{yr_short}5", f"3{yr_short}8"]
+        terms_to_try = [f"3{yr_short}{t_dig}" for t_dig in preferred_tris]
 
         for term_code in terms_to_try:
             url = f"https://api-lt.griffith.edu.au/curriculumapi/v1/course/{clean_code}/{yr}/{term_code}?subscription-key={subscription_key}"
             try:
-                resp = requests.get(url, headers=headers, timeout=8)
+                resp = http_session.get(url, headers=headers, timeout=4)
                 if resp.status_code == 200:
                     data = resp.json()
                     mapped = data.get("mappedData", {}).get("components", {})
@@ -565,7 +609,6 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
                     prog_restrictions = extract_program_restrictions(combined_req_text, mapped_components=mapped)
 
-                    # Inside fetch_course_from_curriculum_api after parsing prog_restrictions:
                     campuses = []
                     cmps_val = mapped.get("crseCmps", {}).get("value", [])
                     if isinstance(cmps_val, list):
@@ -587,7 +630,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
                     campuses = list(dict.fromkeys([c for c in campuses if c]))
 
-                    final_offerings = list(catalog_offerings)
+                    final_offerings = list(catalog_offerings or [])
                     if not final_offerings:
                         tri_val = mapped.get("crseTri", {}).get("value", [])
                         if isinstance(tri_val, list): final_offerings.extend(tri_val)
@@ -603,7 +646,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                         "credit_points": cp,
                         "description": desc_text,
                         "offerings": list(dict.fromkeys(final_offerings)),
-                        "campuses": campuses, # <-- Stored in curriculum API metadata
+                        "campuses": campuses,
                         "career": data.get("subtype", "Undergraduate"),
                         "group": data.get("orgParent", "Other"),
                         "subject_area": get_course_subject_area(clean_code),
@@ -620,29 +663,106 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
     return None
 
+
 def lookup_course(clean_code: str, selected_year: int = None):
+    if not clean_code:
+        return None
     if selected_year is None:
         selected_year = datetime.now().year
 
     clean_code = str(clean_code).replace(" ", "").upper().strip()
+    live_cache = get_live_course_cache()
     catalog_entry = catalog.get(clean_code, {})
 
-    # If already verified via Curriculum API, return immediately from memory
+    # 1. Instant RAM hit
+    if clean_code in live_cache:
+        cached = live_cache[clean_code]
+        if isinstance(cached, dict):
+            catalog[clean_code] = cached
+            return cached
+        else:
+            # Previously confirmed 404 in Curriculum API -> return catalog stub immediately
+            if catalog_entry:
+                catalog_entry["from_curriculum_api"] = True
+                return catalog_entry
+            return None
+
     if catalog_entry.get("from_curriculum_api"):
+        live_cache[clean_code] = catalog_entry
         return catalog_entry
 
+    # 2. Live fetch
     offerings = catalog_entry.get("offerings", [])
-    print(f"[COURSE LOOKUP] Fetching live requisites for {clean_code} from Curriculum API...", flush=True)
-    curriculum_meta = fetch_course_from_curriculum_api(clean_code, selected_year, offerings)
-    
+    curriculum_meta = _fetch_course_api_worker(get_http_session(), clean_code, selected_year, offerings)
+
     if curriculum_meta:
-        print(f"[COURSE LOOKUP] ✅ {clean_code}: Pre='{curriculum_meta['prereq_display']}', Co={curriculum_meta['coreqs']}, Anti={curriculum_meta['incompatibles']}, Prog={curriculum_meta['program_restrictions']}", flush=True)
+        live_cache[clean_code] = curriculum_meta
         catalog[clean_code] = curriculum_meta
         return curriculum_meta
 
+    # Cache miss so we never repeat 404 calls on this course
+    live_cache[clean_code] = "NOT_FOUND"
     if catalog_entry:
+        catalog_entry["from_curriculum_api"] = True
         return catalog_entry
     return None
+
+
+def lookup_courses_batch(codes: list, selected_year: int = None):
+    """Concurrently enriches a batch of courses using 12 pooled threads."""
+    if not codes:
+        return
+    if selected_year is None:
+        selected_year = datetime.now().year
+
+    live_cache = get_live_course_cache()
+    http_session = get_http_session()
+    to_fetch = []
+
+    for raw_c in codes:
+        c = str(raw_c).replace(" ", "").upper().strip()
+        if not c:
+            continue
+        if c in live_cache:
+            cached = live_cache[c]
+            if isinstance(cached, dict):
+                catalog[c] = cached
+            elif c in catalog:
+                catalog[c]["from_curriculum_api"] = True
+        elif not catalog.get(c, {}).get("from_curriculum_api"):
+            to_fetch.append(c)
+
+    to_fetch = list(dict.fromkeys(to_fetch))
+    if not to_fetch:
+        return
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        future_map = {
+            executor.submit(
+                _fetch_course_api_worker,
+                http_session,
+                c,
+                selected_year,
+                catalog.get(c, {}).get("offerings", [])
+            ): c
+            for c in to_fetch
+        }
+        for fut in as_completed(future_map):
+            c = future_map[fut]
+            try:
+                res = fut.result()
+                if res:
+                    live_cache[c] = res
+                    catalog[c] = res
+                else:
+                    live_cache[c] = "NOT_FOUND"
+                    if c in catalog:
+                        catalog[c]["from_curriculum_api"] = True
+            except Exception:
+                live_cache[c] = "NOT_FOUND"
+
+    print(f"[BATCH LOOKUP] ✅ Enriched {len(to_fetch)} courses concurrently in {time.time() - t0:.2f}s", flush=True)
 
 
 catalog = load_full_catalog()
@@ -1257,9 +1377,11 @@ def validate_plan(plan: dict, catalog_dict: dict):
             placed_coords[c] = (yr, tr)
 
     all_planned = set(placed_coords.keys())
+    lookup_courses_batch(list(all_planned))
     all_planned_or_held = all_planned | set(st.session_state.get("holding_zone", []))
     sel_deg_code = st.session_state.get("selected_degree", {}).get("code") if st.session_state.get("selected_degree") else None
 
+    
     print(f"\n[VALIDATE PLAN] Validating {len(all_planned)} scheduled courses against plan...", flush=True)
 
     for (yr, tr), courses in plan.items():
@@ -1411,22 +1533,43 @@ def is_course_degree_compatible(c_info: dict, sel_deg_code: str = None, all_plan
 
     return True, ""
 
-def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
-    code = c_info.get("code")
-    all_planned_or_held = set(planned_coords.keys()) | set(st.session_state.get("holding_zone", []))
+def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, selected_degree_code: str = None, holding_set: set = None) -> tuple[bool, tuple | None, str, list]:
+    """
+    Checks if an elective can be taken:
+    1. Checks degree program compatibility & bidirectional anti-requisites.
+    2. Checks mandatory co-requisites (satisfied if in plan or holding zone).
+    3. Checks cumulative credit points completed in plan.
+    4. Checks course prerequisites against both Plan and Holding Zone.
+       - If satisfied in plan: returns eligible term.
+       - If satisfied via holding zone: returns eligible with holding notification.
+    """
+    if holding_set is None:
+        holding_set = set(st.session_state.get("holding_zone", []))
 
-    # 1. Generalized compatibility & anti-requisite check
+    code = c_info.get("code")
+    all_planned_or_held = set(planned_coords.keys()) | holding_set
+
+    # 1. Degree compatibility & Anti-requisite check
     is_compat, compat_msg = is_course_degree_compatible(c_info, selected_degree_code, all_planned_or_held, catalog)
     if not is_compat:
         return False, None, compat_msg, []
 
-    # 2. Mandatory Co-requisites Check
+    # 2. Mandatory Co-requisites Check (satisfied if in plan OR holding zone)
     coreqs = c_info.get("coreqs", [])
-    missing_coreqs = [cr for cr in coreqs if cr not in planned_coords]
+    missing_coreqs = []
+    holding_coreqs = []
+    for cr in coreqs:
+        if cr in planned_coords:
+            continue
+        elif cr in holding_set:
+            holding_coreqs.append(cr)
+        else:
+            missing_coreqs.append(cr)
+
     if missing_coreqs:
         return False, None, f"⚠️ Requires co-enrolment in: {', '.join(missing_coreqs)}", []
 
-    # 3. Calculate cumulative CP progression by term
+    # 3. Calculate cumulative CP progression by term in plan
     sorted_terms = sorted(plan.keys(), key=lambda t: term_index(t[0], t[1]))
     cum_cp_before_term = {}
     running_cp = 0
@@ -1450,41 +1593,71 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         latest_term_cp = term_index(eligible_term_for_cp[0], eligible_term_for_cp[1]) - 1
         cp_sat_msg = f"{min_cp} CP completed"
 
-    # 5. Course Prerequisites Check (AND/OR Groups)
+    # 5. Course Prerequisites Check (AND/OR Groups) across Plan AND Holding Zone
     p_groups = c_info.get("prereq_groups", [])
     latest_term_courses = 0
     missing_groups = []
-    sat_details = []
+    sat_in_plan_details = []
+    holding_prereqs_used = []
 
     for g in p_groups:
         needed = g.get("count", 1)
         g_courses = g.get("courses", [])
-        sat_in_g = []
+        sat_plan = []
+        sat_holding = []
 
         for p in g_courses:
             if p in planned_coords:
                 pyr, ptr = planned_coords[p]
-                sat_in_g.append((p, pyr, ptr))
+                sat_plan.append((p, pyr, ptr))
+            elif p in holding_set:
+                sat_holding.append(p)
 
-        if len(sat_in_g) < needed:
+        total_satisfied = len(sat_plan) + len(sat_holding)
+        if total_satisfied < needed:
             missing_groups.append(g)
         else:
-            for sc in sat_in_g[:needed]:
+            # Prefer prerequisites completed in the plan
+            plan_take = min(len(sat_plan), needed)
+            for sc in sat_plan[:plan_take]:
                 latest_term_courses = max(latest_term_courses, term_index(sc[1], sc[2]))
-                sat_details.append(f"{sc[0]} (Y{sc[1]} T{sc[2]})")
+                sat_in_plan_details.append(f"{sc[0]} (Y{sc[1]} T{sc[2]})")
+
+            # Remaining requirements fulfilled by holding zone
+            rem_needed = needed - plan_take
+            for hc in sat_holding[:rem_needed]:
+                holding_prereqs_used.append(hc)
 
     if missing_groups:
         missing_str = format_prereq_display(missing_groups)
         return False, None, f"Prerequisites needed: {missing_str}", missing_groups
 
+    # CASE A: Prerequisites met, but one or more are currently in the HOLDING ZONE
+    if holding_prereqs_used or holding_coreqs:
+        parts = []
+        if sat_in_plan_details:
+            parts.append(f"Plan: {', '.join(sat_in_plan_details)}")
+        if holding_prereqs_used:
+            parts.append(f"Prerequisite currently in holding zone: {', '.join(holding_prereqs_used)} (schedule into plan prior)")
+        if holding_coreqs:
+            parts.append(f"Co-requisite in holding zone: {', '.join(holding_coreqs)}")
+        if cp_sat_msg:
+            parts.append(cp_sat_msg)
+
+        expl_msg = "📦 " + " | ".join(parts)
+        print(f"[PREREQ EVAL] Course {code} eligible via holding prereqs: {holding_prereqs_used}", flush=True)
+        # ELIGIBLE: Can be added to holding and shows when 'only_prereqs_met' is checked
+        return True, (1, 1), expl_msg, []
+
+    # CASE B: All prerequisites fully scheduled in the PLAN
     overall_latest_rank = max(latest_term_courses, latest_term_cp)
     ready_yr, ready_tr = term_from_index(overall_latest_rank + 1) if overall_latest_rank > 0 else (1, 1)
 
     all_sat_reasons = []
     if cp_sat_msg:
         all_sat_reasons.append(cp_sat_msg)
-    if sat_details:
-        all_sat_reasons.append(", ".join(sat_details))
+    if sat_in_plan_details:
+        all_sat_reasons.append(", ".join(sat_in_plan_details))
 
     if all_sat_reasons:
         reasons_str = " & ".join(all_sat_reasons)
@@ -2143,7 +2316,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         cr_text = f" | Co: {', '.join(info['coreqs'])}" if info.get("coreqs") else ""
         offs = format_offerings_label(info.get("offerings", []))
 
-        # Campus check against home campus
+        # Solid campus badge with online immunity
         camp_str, is_camp_mismatch = get_campus_badge_data(info.get("campuses", []), home_campus)
         camp_badge = ""
         if camp_str:
@@ -2233,7 +2406,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
 
                 offs = format_offerings_label(c_data.get("offerings", []))
                 
-                # Campus badge in matrix (solid + warning if mismatch)
+                # Solid campus badge in matrix
                 camp_str, is_camp_mismatch = get_campus_badge_data(c_data.get("campuses", []), home_campus)
                 camp_badge_matrix = ""
                 if camp_str:
@@ -2376,38 +2549,49 @@ elif st.session_state.plan:
     st.success("✅ All scheduled courses satisfy prerequisite, corequisite, and offering constraints.")
 
 # -----------------------------------------------------------------------------
-# 12. ADVANCED ELECTIVE & UNIVERSAL COURSE EXPLORER (FULL CATALOG ~3,000 COURSES)
+# 12. ADVANCED ELECTIVE & UNIVERSAL COURSE EXPLORER (LAZY PARALLEL PAGINATION)
 # -----------------------------------------------------------------------------
 if st.session_state.get("selected_degree"):
     with st.expander("💡 Elective & University Course Explorer (Full Catalog)", expanded=False):
         if "sug_page" not in st.session_state:
             st.session_state.sug_page = 1
 
+        live_cache = get_live_course_cache()
         home_campus = st.session_state.get("degree_campus", "")
         deg_flex_set = set(st.session_state.get("degree_flex_courses", []))
         core_set = {c["code"] for c in st.session_state.get("degree_core_courses", [])}
         planned_coords = {c: (yr, tr) for (yr, tr), clist in st.session_state.plan.items() for c in clist}
-        planned_or_held = set(planned_coords.keys()) | set(st.session_state.holding_zone)
+        holding_set = set(st.session_state.get("holding_zone", []))
+        all_planned_or_held = set(planned_coords.keys()) | holding_set
         sel_deg_code = st.session_state.selected_degree.get("code")
 
         candidates = []
         seen_cand = set()
 
-        # 1. Degree Recommended Flexible Courses (Placed First)
+        # 1. Degree Recommended Flexible Courses (Fast in-memory stub assembly; enriched on demand below)
         for f_code in st.session_state.get("degree_flex_courses", []):
-            if f_code not in core_set and f_code not in planned_or_held and f_code not in seen_cand:
+            if f_code not in core_set and f_code not in all_planned_or_held and f_code not in seen_cand:
                 if get_course_level_num(f_code) >= 6:
                     continue
-                info = lookup_course(f_code) or catalog.get(f_code) or {}
-                if info and info.get("code"):
-                    c_copy = dict(info)
-                    c_copy["is_degree_recommended"] = True
-                    candidates.append(c_copy)
-                    seen_cand.add(f_code)
+                cached_entry = live_cache.get(f_code)
+                base_info = cached_entry if isinstance(cached_entry, dict) else catalog.get(f_code, {
+                    "code": f_code,
+                    "title": f_code,
+                    "credit_points": "10",
+                    "offerings": [],
+                    "campuses": [],
+                    "career": "Undergraduate",
+                    "group": "Recommended Elective",
+                    "subject_area": get_course_subject_area(f_code),
+                })
+                c_copy = dict(base_info)
+                c_copy["is_degree_recommended"] = True
+                candidates.append(c_copy)
+                seen_cand.add(f_code)
 
         # 2. Universal Course Catalog across all faculties (Excluding Level 6+)
         for c_code, c_info in catalog.items():
-            if c_code not in core_set and c_code not in planned_or_held and c_code not in seen_cand:
+            if c_code not in core_set and c_code not in all_planned_or_held and c_code not in seen_cand:
                 if get_course_level_num(c_code) >= 6:
                     continue
 
@@ -2415,7 +2599,8 @@ if st.session_state.get("selected_degree"):
                 if "postgrad" in career or "research" in career:
                     continue
 
-                c_copy = dict(c_info)
+                cached_entry = live_cache.get(c_code)
+                c_copy = dict(cached_entry) if isinstance(cached_entry, dict) else dict(c_info)
                 c_copy["is_degree_recommended"] = (c_code in deg_flex_set)
                 candidates.append(c_copy)
                 seen_cand.add(c_code)
@@ -2455,26 +2640,30 @@ if st.session_state.get("selected_degree"):
                 "Only show courses with prerequisites satisfied in plan",
                 value=True,
                 key="sug_filter_prereq_met",
-                help="Filters to courses that are compatible with your degree and have all prerequisites satisfied in your current plan."
+                help="Filters to courses that are compatible with your degree and have all prerequisites satisfied in your plan or currently in your holding zone."
             )
         with col_pp:
             per_page = st.selectbox("Per Page", options=[10, 25, 50], index=0, key="sug_per_page")
 
-        # --- ACCURATE FILTERING ENGINE (PRE-ENRICHES CANDIDATES BEFORE FILTERING) ---
-        filtered_sug = []
         kw = sug_keyword.strip().lower()
 
+        # Reset to Page 1 whenever any filter changes
+        filter_sig = (tuple(sel_groups), tuple(sel_levels), tuple(sel_areas), kw, only_prereqs_met, per_page)
+        if st.session_state.get("last_sug_filter_sig") != filter_sig:
+            st.session_state.last_sug_filter_sig = filter_sig
+            st.session_state.sug_page = 1
+
+        # --- STAGE 1: INSTANT IN-MEMORY PRE-FILTER ---
+        pre_filtered = []
         for c in candidates:
             code = c["code"]
+            if get_course_level_num(code) >= 6:
+                continue
+
             grp = c.get("group", "Other")
             lvl = get_course_level_label(code)
             area = c.get("subject_area") or get_course_subject_area(code)
 
-            # Filter out Level 6+ courses
-            if get_course_level_num(code) >= 6:
-                continue
-
-            # Standard facet filtering
             if sel_groups and grp not in sel_groups:
                 continue
             if sel_levels and lvl not in sel_levels:
@@ -2486,77 +2675,172 @@ if st.session_state.get("selected_degree"):
                 if kw not in searchable:
                     continue
 
-            # Pre-enrich candidate with live Curriculum API requisites BEFORE checking prerequisites
-            c_full = c
-            if not c.get("from_curriculum_api"):
-                # Lookup live metadata for matching candidate
-                enriched = lookup_course(code)
-                if enriched:
-                    enriched["is_degree_recommended"] = (code in deg_flex_set) or c.get("is_degree_recommended", False)
-                    c_full = enriched
-
-            # Evaluate with live requisites
-            is_compat, compat_msg = is_course_degree_compatible(c_full, sel_deg_code, planned_or_held, catalog)
-            is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(c_full, st.session_state.plan, planned_coords, sel_deg_code)
-            rank_score = term_index(early_term[0], early_term[1]) if early_term else 9999
-            is_rec = (code in deg_flex_set) or c_full.get("is_degree_recommended", False)
-
-            # STRICT PRE-FILTER: Discard any incompatible degree courses or unsatisfied prereqs
+            # Instant preliminary check using whatever data is already in memory
             if only_prereqs_met:
-                if not is_compat or not is_elig:
+                is_compat_stub, _ = is_course_degree_compatible(c, sel_deg_code, all_planned_or_held, catalog)
+                is_elig_stub, _, _, _ = evaluate_elective_prereqs(
+                    c, st.session_state.plan, planned_coords, sel_deg_code, holding_set=holding_set
+                )
+                if not is_compat_stub or not is_elig_stub:
                     continue
 
-            filtered_sug.append({
-                "course": c_full,
-                "is_eligible": is_elig,
-                "is_degree_compat": is_compat,
-                "is_degree_recommended": is_rec,
-                "earliest_term": early_term,
-                "earliest_term_rank": rank_score,
-                "explanation": expl_msg,
-                "missing": missing,
-                "level": lvl,
-                "subject_area": area
-            })
+            pre_filtered.append(c)
 
-        # Sort: Recommended electives ALWAYS first, then eligible courses, then by earliest availability
-        filtered_sug.sort(key=lambda x: (
-            not x["is_degree_recommended"],
-            not x["is_eligible"],
-            x["earliest_term_rank"],
-            x["course"]["code"]
+        # Sort pre-filtered so Recommended Electives and lower-level courses are checked first
+        pre_filtered.sort(key=lambda c: (
+            not ((c["code"] in deg_flex_set) or c.get("is_degree_recommended", False)),
+            get_course_level_num(c["code"]),
+            c["code"]
         ))
 
-        total_results = len(filtered_sug)
+        curr_page = max(1, st.session_state.sug_page)
+        start_idx = (curr_page - 1) * per_page
+        end_idx = start_idx + per_page
 
-        if total_results == 0:
-            st.info("No courses match your active filter criteria and prerequisite settings.")
-        else:
+        # --- STAGE 2: JUST-IN-TIME PARALLEL API VERIFICATION ---
+        filtered_sug = []
+        unscanned_remaining = 0
+
+        if not only_prereqs_met:
+            # No prereq filtering needed -> slice exact page and enrich ONLY those page items!
+            total_results = len(pre_filtered)
             total_pages = max(1, (total_results + per_page - 1) // per_page)
-            st.session_state.sug_page = min(max(1, st.session_state.sug_page), total_pages)
-            curr_page = st.session_state.sug_page
-
+            curr_page = min(curr_page, total_pages)
+            st.session_state.sug_page = curr_page
             start_idx = (curr_page - 1) * per_page
             end_idx = min(start_idx + per_page, total_results)
+
+            raw_slice = pre_filtered[start_idx:end_idx]
+            lookup_courses_batch([c["code"] for c in raw_slice])
+
+            page_items = []
+            for c in raw_slice:
+                code = c["code"]
+                c_full = dict(catalog.get(code, c))
+                is_rec = (code in deg_flex_set) or c.get("is_degree_recommended", False)
+                c_full["is_degree_recommended"] = is_rec
+
+                is_compat, _ = is_course_degree_compatible(c_full, sel_deg_code, all_planned_or_held, catalog)
+                is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(
+                    c_full, st.session_state.plan, planned_coords, sel_deg_code, holding_set=holding_set
+                )
+                page_items.append({
+                    "course": c_full,
+                    "is_eligible": is_elig,
+                    "is_degree_compat": is_compat,
+                    "is_degree_recommended": is_rec,
+                    "earliest_term": early_term,
+                    "earliest_term_rank": term_index(early_term[0], early_term[1]) if early_term else 9999,
+                    "explanation": expl_msg,
+                    "missing": missing,
+                    "level": get_course_level_label(code),
+                    "subject_area": c_full.get("subject_area") or get_course_subject_area(code)
+                })
+        else:
+            # Prereq filter is ON -> verify in parallel batches of 30 until current page (+ lookahead) is filled!
+            # If pool is small (<= 60, e.g. keyword search), verify all at once for exact count.
+            verify_all = len(pre_filtered) <= 60
+            target_valid_needed = len(pre_filtered) if verify_all else (end_idx + per_page)
+
+            BATCH_SIZE = 30
+            MAX_UNCACHED_FETCHES = 90  # Hard safety cap so a single render never blocks > ~1s
+            uncached_fetched = 0
+            idx_cursor = 0
+
+            while idx_cursor < len(pre_filtered):
+                chunk = pre_filtered[idx_cursor : idx_cursor + BATCH_SIZE]
+                idx_cursor += BATCH_SIZE
+
+                uncached_in_chunk = [
+                    c["code"] for c in chunk
+                    if c["code"] not in live_cache and not c.get("from_curriculum_api")
+                ]
+
+                if uncached_in_chunk:
+                    lookup_courses_batch(uncached_in_chunk)
+                    uncached_fetched += len(uncached_in_chunk)
+
+                for c in chunk:
+                    code = c["code"]
+                    c_full = dict(catalog.get(code, c))
+                    is_rec = (code in deg_flex_set) or c.get("is_degree_recommended", False)
+                    c_full["is_degree_recommended"] = is_rec
+
+                    # Re-check level/facets in case stub lacked metadata
+                    if get_course_level_num(code) >= 6:
+                        continue
+                    if sel_groups and c_full.get("group", "Other") not in sel_groups:
+                        continue
+
+                    is_compat, _ = is_course_degree_compatible(c_full, sel_deg_code, all_planned_or_held, catalog)
+                    is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(
+                        c_full, st.session_state.plan, planned_coords, sel_deg_code, holding_set=holding_set
+                    )
+
+                    if not is_compat or not is_elig:
+                        continue
+
+                    filtered_sug.append({
+                        "course": c_full,
+                        "is_eligible": is_elig,
+                        "is_degree_compat": is_compat,
+                        "is_degree_recommended": is_rec,
+                        "earliest_term": early_term,
+                        "earliest_term_rank": term_index(early_term[0], early_term[1]) if early_term else 9999,
+                        "explanation": expl_msg,
+                        "missing": missing,
+                        "level": get_course_level_label(code),
+                        "subject_area": c_full.get("subject_area") or get_course_subject_area(code)
+                    })
+
+                if not verify_all and len(filtered_sug) >= target_valid_needed:
+                    break
+                if uncached_fetched >= MAX_UNCACHED_FETCHES and len(filtered_sug) > start_idx:
+                    break
+
+            unscanned_remaining = max(0, len(pre_filtered) - idx_cursor)
+
+            filtered_sug.sort(key=lambda x: (
+                not x["is_degree_recommended"],
+                not x["is_eligible"],
+                x["earliest_term_rank"],
+                x["course"]["code"]
+            ))
+
+            total_results = len(filtered_sug) + unscanned_remaining
+            total_pages = max(1, (total_results + per_page - 1) // per_page)
+            curr_page = min(curr_page, max(1, (len(filtered_sug) + per_page - 1) // per_page)) if unscanned_remaining == 0 else curr_page
+            st.session_state.sug_page = curr_page
+
+            start_idx = (curr_page - 1) * per_page
+            end_idx = min(start_idx + per_page, len(filtered_sug))
             page_items = filtered_sug[start_idx:end_idx]
 
+        # --- RENDER RESULTS ---
+        if not page_items:
+            st.info("No courses match your active filter criteria and prerequisite settings.")
+        else:
             col_count, col_nav = st.columns([3, 2])
             with col_count:
-                st.markdown(f"**Showing {start_idx + 1}–{end_idx} of {total_results:,} available courses**")
+                if unscanned_remaining > 0:
+                    st.markdown(f"**Showing {start_idx + 1}–{end_idx} of {total_results:,}+ candidate courses**")
+                else:
+                    st.markdown(f"**Showing {start_idx + 1}–{end_idx} of {total_results:,} available courses**")
             with col_nav:
                 c_prev, c_txt, c_next = st.columns([1, 1.8, 1])
+                has_next = (curr_page < total_pages) and (end_idx < len(filtered_sug) or unscanned_remaining > 0 or not only_prereqs_met)
                 with c_prev:
                     if st.button("⬅️ Prev", disabled=(curr_page <= 1), use_container_width=True, key="sug_prev_btn"):
                         st.session_state.sug_page -= 1
                         st.rerun()
                 with c_txt:
-                    st.markdown(f"<div style='text-align:center; padding-top:4px; font-weight:600; font-size:12px;'>Page {curr_page} of {total_pages}</div>", unsafe_allow_html=True)
+                    page_suffix = "+" if unscanned_remaining > 0 else ""
+                    st.markdown(f"<div style='text-align:center; padding-top:4px; font-weight:600; font-size:12px;'>Page {curr_page} of {total_pages}{page_suffix}</div>", unsafe_allow_html=True)
                 with c_next:
-                    if st.button("Next ➡️", disabled=(curr_page >= total_pages), use_container_width=True, key="sug_next_btn"):
+                    if st.button("Next ➡️", disabled=(not has_next), use_container_width=True, key="sug_next_btn"):
                         st.session_state.sug_page += 1
                         st.rerun()
 
-            # --- CSS FOR SOLID, NON-TRANSPARENT CAMPUS AND STATUS BADGES ---
             st.markdown(
                 """
                 <style>
@@ -2583,8 +2867,6 @@ if st.session_state.get("selected_degree"):
                 .tag-area { background: rgba(112, 161, 255, 0.18); color: #70a1ff; border: 1px solid rgba(112, 161, 255, 0.35); }
                 .tag-level { background: rgba(165, 94, 234, 0.18); color: #a55eea; border: 1px solid rgba(165, 94, 234, 0.35); }
                 .tag-off { background: rgba(255, 165, 2, 0.18); color: #ffa502; border: 1px solid rgba(255, 165, 2, 0.35); }
-                
-                /* 100% Solid, Non-Transparent Campus Badges */
                 .tag-campus { 
                     background: #00564d !important; 
                     color: #ffffff !important; 
@@ -2598,7 +2880,6 @@ if st.session_state.get("selected_degree"):
                     opacity: 1 !important;
                     box-shadow: 0 0 6px rgba(255, 77, 77, 0.6) !important;
                 }
-
                 .tag-cp { background: rgba(255, 255, 255, 0.1); color: #f1f2f6; }
                 .tag-rec { 
                     background: rgba(255, 215, 0, 0.25) !important; 
@@ -2608,6 +2889,7 @@ if st.session_state.get("selected_degree"):
                     letter-spacing: 0.5px !important;
                 }
                 .status-ready { color: #2ed573; font-weight: 600; font-size: 11px; }
+                .status-holding { color: #70a1ff; font-weight: 600; font-size: 11px; }
                 .status-pending { color: #ff9f1a; font-weight: 600; font-size: 11px; }
                 </style>
                 """,
@@ -2615,10 +2897,6 @@ if st.session_state.get("selected_degree"):
             )
 
             for item in page_items:
-                # Secondary Guard: Skip any items with unsatisfied requisites if filter is active
-                if only_prereqs_met and (not item["is_degree_compat"] or not item["is_eligible"]):
-                    continue
-
                 c_info = item["course"]
                 c_code = c_info["code"]
                 title = c_info["title"]
@@ -2628,7 +2906,6 @@ if st.session_state.get("selected_degree"):
                 lvl_tag = item["level"].split(" ")[0] + " " + item["level"].split(" ")[1]
                 expl = item["explanation"]
 
-                # Campus label with home campus comparison
                 camp_str, is_camp_mismatch = get_campus_badge_data(c_info.get("campuses", []), home_campus)
                 camp_tag_html = ""
                 if camp_str:
@@ -2637,7 +2914,11 @@ if st.session_state.get("selected_degree"):
                     else:
                         camp_tag_html = f'<span class="tag-pill tag-campus" title="Offered at: {camp_str}">📍 {camp_str}</span>'
 
-                status_class = "status-ready" if item["is_eligible"] else "status-pending"
+                if item["is_eligible"]:
+                    status_class = "status-holding" if "holding zone" in expl else "status-ready"
+                else:
+                    status_class = "status-pending"
+
                 rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if item["is_degree_recommended"] else ''
 
                 with st.container():
