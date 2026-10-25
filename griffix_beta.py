@@ -111,14 +111,12 @@ def parse_rule_definition_to_groups(rule_def: str, rule_sum: str = "") -> list:
     if not text_to_parse:
         return groups
 
-    # Split top-level by AND clauses first
     and_clauses = re.split(r'\s+AND\s+', text_to_parse, flags=re.I)
     for clause in and_clauses:
         clause = clause.strip()
         if not clause:
             continue
 
-        # Check if clause contains OR choices
         or_subclauses = re.split(r'\s+OR\s+|/', clause, flags=re.I)
         all_codes_in_clause = []
         min_count = 1
@@ -361,7 +359,26 @@ def lookup_course(clean_code: str, selected_year: int = None):
     return None
 
 # -----------------------------------------------------------------------------
-# 4. LIVE DEGREE SEARCH & CURRICULUM PRESCRIBED STUDY PLAN
+# 4. OFFERING AVAILABILITY CHECKER (DEFINED BEFORE VALIDATION)
+# -----------------------------------------------------------------------------
+def is_course_offered_in_term(c_info: dict, trimester: int) -> bool:
+    """Checks whether the course is actively scheduled in Trimester 1, 2, or 3."""
+    if not c_info:
+        return True
+    offerings = c_info.get("offerings", [])
+    if not offerings:
+        return True
+    offs_lower = [str(o).lower() for o in offerings]
+    if trimester == 1:
+        return any("trimester 1" in o or "t1" in o for o in offs_lower)
+    elif trimester == 2:
+        return any("trimester 2" in o or "t2" in o for o in offs_lower)
+    elif trimester == 3:
+        return any("summer" in o or "trimester 3" in o or "t3" in o for o in offs_lower)
+    return False
+
+# -----------------------------------------------------------------------------
+# 5. LIVE DEGREE SEARCH & CURRICULUM PRESCRIBED STUDY PLAN
 # -----------------------------------------------------------------------------
 def get_fallback_degrees():
     raw_list = [
@@ -599,7 +616,6 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
                 break
         target_study_plan_comp = chosen_plan.get("progRuleStdyPlan", {})
 
-    # Extract all core courses and OR relationships
     seen_codes = set()
     for entry in target_core_data:
         list_or = entry.get("listOr", [])
@@ -626,7 +642,6 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
                 "or_group": or_partners
             })
 
-    # Study plan parsing
     sp_items = target_study_plan_comp.get("studyPlanItems", [])
     matched_sp = None
     for sp in sp_items:
@@ -661,7 +676,6 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
                         row_list = row.get("list", [])
                         row_codes = [str(item.get("itemCode", "")).replace(" ", "").upper() for item in row_list if item.get("itemCode")]
 
-                        # Accumulate term target CP from rows/units
                         for r_item in row_list:
                             try:
                                 term_cp += int(r_item.get("units", 10))
@@ -669,13 +683,11 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
                                 term_cp += 10
 
                         if row_codes:
-                            # Primary course placed directly into the degree progression matrix
                             primary_code = row_codes[0]
                             if primary_code not in placed_in_plan:
                                 term_slot_courses.append(primary_code)
                                 placed_in_plan.add(primary_code)
 
-                            # Alternative choices go to holding zone
                             if len(row_codes) > 1:
                                 for alt_code in row_codes[1:]:
                                     if alt_code not in holding_alternatives:
@@ -699,7 +711,6 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
             2: [1, 2]  # No Trimester 3 for Year 2!
         }
 
-    # Any remaining unplaced core courses get placed in holding zone
     for c in core_courses:
         code = c["code"]
         if code not in placed_in_plan and code not in holding_alternatives:
@@ -723,7 +734,7 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
     }
 
 # -----------------------------------------------------------------------------
-# 5. PLAN VALIDATION ENGINE (AND / OR AWARE)
+# 6. PLAN VALIDATION ENGINE (AND / OR AWARE)
 # -----------------------------------------------------------------------------
 def term_index(year: int, trimester: int) -> int:
     return (year - 1) * 3 + trimester
@@ -810,7 +821,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
 plan_warnings, plan_satisfied = validate_plan(st.session_state.plan, catalog)
 
 # -----------------------------------------------------------------------------
-# 6. STREAMLIT-JS ACTION BRIDGE
+# 7. STREAMLIT-JS ACTION BRIDGE
 # -----------------------------------------------------------------------------
 st.markdown(
     """
@@ -881,7 +892,7 @@ if bridge_input:
         st.rerun()
 
 # -----------------------------------------------------------------------------
-# 7. SIDEBAR: DEGREE SELECTION, COURSE SEARCH & STRUCTURE
+# 8. SIDEBAR: DEGREE SELECTION, COURSE SEARCH & STRUCTURE
 # -----------------------------------------------------------------------------
 with st.sidebar:
     # -------------------------------------------------------------------------
@@ -1076,7 +1087,7 @@ with st.sidebar:
         st.rerun()
 
 # -----------------------------------------------------------------------------
-# 8. HTML, CSS & JS COMPONENT BUILDER
+# 9. HTML, CSS & JS COMPONENT BUILDER
 # -----------------------------------------------------------------------------
 def string_to_pastel_hex(code_string: str) -> str:
     """Generates a deterministic pastel hex color from the course code."""
@@ -1272,7 +1283,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         100% { box-shadow: 0 0 6px rgba(255, 71, 87, 0.5); }
     }
 
-    /* Scrollable, Responsive Holding Grid (Never pushes matrix off screen) */
+    /* Scrollable, Responsive Holding Grid */
     .holding-grid {
         display: grid;
         grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
@@ -1431,7 +1442,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
     html += "<div class='section-title'>📅 Degree Progression Matrix</div>"
 
     for yr in range(1, num_years + 1):
-        # Determine which trimesters exist for this year (e.g. BMedSci Year 2 only has T1, T2)
         default_terms = [1, 2, 3] if include_t3 else [1, 2]
         terms_for_year = active_terms_map.get(yr, default_terms)
 
@@ -1583,7 +1593,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
     return html
 
 # -----------------------------------------------------------------------------
-# 9. MAIN VIEW
+# 10. MAIN VIEW
 # -----------------------------------------------------------------------------
 render_title_html = """
 <div style="display: flex; align-items: center; margin-bottom: 0.8rem;">
