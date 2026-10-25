@@ -141,23 +141,73 @@ def extract_course_codes(text: str):
     matches = re.findall(pattern, text)
     return list(dict.fromkeys(m.upper() for m in matches))
 
-def extract_program_restrictions(desc: str) -> list:
-    """Extracts 4-digit program degree code restrictions from requisites."""
-    if not desc:
-        return []
-    patterns = [
-        r'must be undertaking\s+([0-9]{4})',
-        r'must be enrolled in\s+(?:the\s+)?([0-9]{4})',
-        r'enrolled in\s+(?:program\s+)?([0-9]{4})',
-        r'restricted to\s+(?:students in\s+)?(?:program\s+)?([0-9]{4})',
-        r'program\s+([0-9]{4})\s+students',
-    ]
+def extract_program_restrictions(desc: str, mapped_components: dict = None) -> list:
+    """
+    Extracts 4-digit program/degree code restrictions from text, requisites, 
+    and curriculum API mapped components (e.g. 1613 for Dental Hygiene).
+    """
     restricted = []
+
+    # 1. Parse structured mappedData components if available
+    if mapped_components and isinstance(mapped_components, dict):
+        for comp_key, comp_val in mapped_components.items():
+            comp_key_lower = comp_key.lower()
+            
+            # Check enrolment requirement groups (e.g. crseOfrgRqmntGrp, crseOfrgRqmntGrpGc)
+            if "rqmntgrp" in comp_key_lower:
+                val_obj = comp_val.get("value", {})
+                if isinstance(val_obj, dict):
+                    combined_str = f"{val_obj.get('value', '')} {val_obj.get('description', '')}"
+                    for m in re.finditer(r'(?:prog(?:ram)?[:\s]+)?\b([0-9]{4})\b', combined_str, re.I):
+                        c = m.group(1)
+                        if c not in restricted and not (c.startswith("20") and int(c) >= 2020):
+                            restricted.append(c)
+
+                    # Check nested table rows
+                    for row in val_obj.get("rows", []):
+                        if isinstance(row, dict):
+                            for cell in row.values():
+                                if isinstance(cell, dict):
+                                    cell_str = f"{cell.get('value', '')} {cell.get('description', '')}"
+                                    for m in re.finditer(r'(?:prog(?:ram)?[:\s]+)?\b([0-9]{4})\b', cell_str, re.I):
+                                        c = m.group(1)
+                                        if c not in restricted and not (c.startswith("20") and int(c) >= 2020):
+                                            restricted.append(c)
+
+            # Check program link tags like <linked-co data-code='1613' />
+            if "pstn" in comp_key_lower or "requiste" in comp_key_lower:
+                val_str = str(comp_val.get("value", ""))
+                for m in re.finditer(r'data-code=[\'"]([0-9]{4})[\'"]', val_str, re.I):
+                    c = m.group(1)
+                    if c not in restricted:
+                        restricted.append(c)
+
+    if not desc:
+        return restricted
+
+    # 2. Text patterns that allow degree titles between 'enrolled in' and the code
+    patterns = [
+        # Matches: "must be enrolled in Bachelor of Dental Hygiene 1613"
+        r'must be enrolled in\s+[^.;\n\d]*\b([0-9]{4})\b',
+        # Matches: "must be undertaking Bachelor of Medical Science 1280"
+        r'must be undertaking\s+[^.;\n\d]*\b([0-9]{4})\b',
+        # Matches: "Restrictions: must be enrolled in ... 1613"
+        r'restrictions?:\s*[^.;\n\d]*\b([0-9]{4})\b',
+        # Matches: "restricted to students in ... 1613"
+        r'restricted to\s+[^.;\n\d]*\b([0-9]{4})\b',
+        # Matches: "Prog: 1613" or "Program: 1613"
+        r'\b(?:prog(?:ram)?)\s*[:#]?\s*([0-9]{4})\b',
+        # Matches: data-code="1613"
+        r'data-code=[\'"]([0-9]{4})[\'"]'
+    ]
+
     for pat in patterns:
         for match in re.finditer(pat, desc, re.I):
             c = match.group(1)
-            if c not in restricted:
+            # Avoid matching years like 2024, 2025, 2026, 2027
+            if c not in restricted and not (c.startswith("20") and int(c) >= 2020):
                 restricted.append(c)
+
     return restricted
 
 def extract_cp_prereq(rule_def: str = "", rule_sum: str = "", desc: str = "") -> int:
@@ -464,7 +514,8 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
                     other_req = mapped.get("crseOthrRequiste", {}).get("value") or ""
                     desc_text = mapped.get("crseDescr", {}).get("value", "")
-                    combined_req_text = f"{other_req} {desc_text}"
+                    cmmt_pstn = mapped.get("crseCmmtCrsePstn", {}).get("value") or ""
+                    combined_req_text = f"{other_req} {desc_text} {cmmt_pstn}"
 
                     desc_cp = extract_cp_prereq("", "", combined_req_text)
                     if desc_cp > min_cp:
@@ -474,7 +525,8 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     if incomp_match:
                         incompatibles.extend([c for c in extract_course_codes(incomp_match.group(1)) if c != clean_code])
 
-                    prog_restrictions = extract_program_restrictions(combined_req_text)
+                    # Pass both the text and the mapped components
+                    prog_restrictions = extract_program_restrictions(combined_req_text, mapped_components=mapped)
 
                     final_offerings = list(catalog_offerings)
                     if not final_offerings:
@@ -1220,28 +1272,38 @@ def validate_plan(plan: dict, catalog_dict: dict):
 
 def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
     """
-    Checks if an elective can be taken SOME TIME during the program:
-    1. Checks program restrictions (e.g. 'Must be undertaking 1651').
+    Checks if an elective can be taken:
+    1. Checks program restrictions (e.g. 1000DOH restricted to 1613).
     2. Checks incompatibility with scheduled courses.
-    3. Checks CP prerequisites (e.g. '80 CP completed').
-    4. Checks if all prerequisite groups are satisfied by courses scheduled in the degree.
+    3. Checks corequisites (e.g. 1000DOH requires 1036DOH).
+    4. Checks minimum prior CP (e.g. 80 CP).
+    5. Checks prerequisite completion.
     """
     code = c_info.get("code")
 
     # 1. Program / Degree Restriction
     prog_restr = c_info.get("program_restrictions", [])
     if prog_restr and selected_degree_code:
-        if selected_degree_code not in prog_restr:
-            return False, None, f"Restricted to program(s): {', '.join(prog_restr)}", []
+        deg_code_clean = str(selected_degree_code).strip()
+        restr_clean = [str(x).strip() for x in prog_restr]
+        if deg_code_clean not in restr_clean:
+            return False, None, f"🚫 Restricted: Only open to students in program(s): {', '.join(restr_clean)}", []
 
-    # 2. Incompatibility
+    # 2. Incompatibility / Anti-requisites
     incomps = c_info.get("incompatibles", [])
     for inc in incomps:
         if inc in planned_coords:
             pyr, ptr = planned_coords[inc]
-            return False, None, f"Incompatible with {inc} (in plan Y{pyr} T{ptr})", []
+            return False, None, f"🚫 Incompatible with {inc} (scheduled in plan Y{pyr} T{ptr})", []
 
-    # Calculate cumulative CP progression by term to evaluate 80CP/120CP prerequisites
+    # 3. Corequisites Check (Must be scheduled in or before the term)
+    coreqs = c_info.get("coreqs", [])
+    missing_coreqs = []
+    for cr in coreqs:
+        if cr not in planned_coords:
+            missing_coreqs.append(cr)
+    
+    # 4. Calculate cumulative CP progression by term
     sorted_terms = sorted(plan.keys(), key=lambda t: term_index(t[0], t[1]))
     cum_cp_before_term = {}
     running_cp = 0
@@ -1250,7 +1312,7 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         term_courses = plan[t]
         running_cp += sum(int((catalog.get(tc) or {}).get("credit_points", 10) or 10) for tc in term_courses)
 
-    # 3. CP Prerequisite Check (e.g. 80 CP for 3002LFC)
+    # 5. CP Prerequisite Check
     min_cp = c_info.get("min_cp_prereq", 0)
     latest_term_cp = 0
     cp_sat_msg = ""
@@ -1265,7 +1327,7 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         latest_term_cp = term_index(eligible_term_for_cp[0], eligible_term_for_cp[1]) - 1
         cp_sat_msg = f"{min_cp} CP completed"
 
-    # 4. Course Prerequisites Check
+    # 6. Course Prerequisites Check
     p_groups = c_info.get("prereq_groups", [])
     latest_term_courses = 0
     missing_groups = []
@@ -1292,7 +1354,11 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         missing_str = format_prereq_display(missing_groups)
         return False, None, f"Prerequisites needed: {missing_str}", missing_groups
 
-    # Combine Course and CP eligibility
+    # If prerequisites are met but mandatory corequisites are missing from the plan:
+    if missing_coreqs:
+        return False, None, f"Requires co-enrolment in: {', '.join(missing_coreqs)}", []
+
+    # Calculate earliest availability
     overall_latest_rank = max(latest_term_courses, latest_term_cp)
     ready_yr, ready_tr = term_from_index(overall_latest_rank + 1) if overall_latest_rank > 0 else (1, 1)
 
