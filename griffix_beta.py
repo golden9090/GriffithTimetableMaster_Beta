@@ -552,6 +552,62 @@ def fetch_degree_program_rules(degree_code: str):
             continue
     return None
 
+def optimize_prescribed_plan(plan: dict, catalog_dict: dict) -> dict:
+    """
+    Smart-adjusts the auto-populated plan by swapping courses across terms
+    if a course is placed in an off-term (e.g. swapping 2525LHS and 2022MSC),
+    ensuring all offering terms and prerequisites are satisfied.
+    """
+    for clist in plan.values():
+        for code in clist:
+            if code not in catalog_dict:
+                lookup_course(code)
+
+    def evaluate_conflicts(p):
+        warns, _ = validate_plan(p, catalog_dict)
+        offering_penalty = sum(1 for wlist in warns.values() for w in wlist if "not usually offered" in w.lower())
+        prereq_penalty = sum(10 for wlist in warns.values() for w in wlist if "prereq" in w.lower())
+        return offering_penalty * 2 + prereq_penalty
+
+    changed = True
+    iterations = 0
+    while changed and iterations < 10:
+        changed = False
+        iterations += 1
+        current_score = evaluate_conflicts(plan)
+        if current_score == 0:
+            break
+
+        terms = list(plan.keys())
+        for i, t1 in enumerate(terms):
+            for t2 in terms[i+1:]:
+                for c1 in list(plan[t1]):
+                    for c2 in list(plan[t2]):
+                        # Test tentative swap
+                        plan[t1].remove(c1)
+                        plan[t2].remove(c2)
+                        plan[t1].append(c2)
+                        plan[t2].append(c1)
+
+                        new_score = evaluate_conflicts(plan)
+                        if new_score < current_score:
+                            # Swap resolves conflicts without breaking prerequisites
+                            current_score = new_score
+                            changed = True
+                            break
+                        else:
+                            # Revert swap
+                            plan[t1].remove(c2)
+                            plan[t2].remove(c1)
+                            plan[t1].append(c1)
+                            plan[t2].append(c2)
+                    if changed:
+                        break
+                if changed:
+                    break
+
+    return plan
+
 def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimester 1", campus_preference=None, study_mode="Full-time", fallback_duration=3):
     """
     Parses program rules JSON to:
@@ -725,6 +781,9 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
         for y in range(1, duration_years + 1):
             if y not in active_terms_per_year:
                 active_terms_per_year[y] = [1, 2, 3] if include_t3 else [1, 2]
+
+    # Smart swap pass: resolves offering mismatches (e.g. swaps 2525LHS <-> 2022MSC)
+    prescribed_matrix_plan = optimize_prescribed_plan(prescribed_matrix_plan, catalog)
 
     return core_courses, prescribed_matrix_plan, holding_alternatives, course_or_map, {
         "duration_years": duration_years,
