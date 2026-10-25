@@ -292,126 +292,111 @@ import traceback
 import time
 
 # -----------------------------------------------------------------------------
-# 5. FULL CATALOG LOADER WITH FLUSHED DIAGNOSTICS & WAF HEADERS
+# 5. FULL CATALOG LOADER WITH DIAGNOSTICS & MULTI-PATH RESOLUTION
 # -----------------------------------------------------------------------------
-BROWSER_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-AU,en-US;q=0.9,en;q=0.8",
-    "Referer": "https://www.griffith.edu.au/",
-    "Origin": "https://www.griffith.edu.au"
-}
+def find_project_file(filename: str):
+    """Finds a local file regardless of execution directory on Streamlit Cloud."""
+    script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "."
+    candidates = [
+        os.path.join(script_dir, filename),
+        os.path.join(os.getcwd(), filename),
+        os.path.join(os.getcwd(), "data", filename),
+        filename
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            print(f"[FILE RESOLVER] ✅ Found '{filename}' at: {path}", flush=True)
+            return path
+    print(f"[FILE RESOLVER] ❌ Could not find '{filename}' in candidate paths: {candidates}", flush=True)
+    return None
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_full_catalog():
-    """Fetches full course catalog across Griffith using Funnelback pagination with logging."""
-    print("\n" + "="*70, flush=True)
-    print("[CATALOG LOADER] Starting full catalog fetch...", flush=True)
+    """Loads course catalog from local courses.json first, then live endpoint."""
     catalog = {}
-    
-    # Try with padrenull query and conservative rank batch of 250
-    base_urls = [
-        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&query=!padrenull&sort=metafborderna&num_ranks=250",
-        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&sort=metafborderna&num_ranks=250",
-        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses&profile=_default&query=!padrenull&num_ranks=250"
-    ]
+    print("\n" + "="*70, flush=True)
+    print("[CATALOG LOADER] Initializing ~3,000 course catalog...", flush=True)
 
-    working_base = None
-    start_rank = 1
+    # 1. Check local pre-downloaded course catalog (Recommended for Streamlit Cloud)
+    for fname in ["courses.json", "catalog.json", "courses_data.json"]:
+        local_path = find_project_file(fname)
+        if local_path:
+            print(f"[CATALOG LOADER] Reading courses from local file: {local_path}", flush=True)
+            try:
+                t0 = time.time()
+                with open(local_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+                    print(f"[CATALOG LOADER] Raw results in file: {len(results)} items", flush=True)
+                    for item in results:
+                        meta = item.get("listMetadata", {})
+                        cat_numbers = meta.get("categoryNumber", [])
+                        if not cat_numbers:
+                            continue
+                        code = str(cat_numbers[0]).replace(" ", "").upper().strip()
+                        desc = meta.get("description", [""])[0] or ""
+                        fallback_groups = parse_rule_definition_to_groups("", desc)
 
-    for attempt_url in base_urls:
-        test_url = f"{attempt_url}&start_rank=1"
-        print(f"[CATALOG LOADER] Testing base endpoint: {test_url}", flush=True)
-        try:
-            t0 = time.time()
-            resp = requests.get(test_url, headers=BROWSER_HEADERS, timeout=15)
-            elapsed = time.time() - t0
-            print(f"[CATALOG LOADER] -> HTTP Status: {resp.status_code} ({elapsed:.2f}s)", flush=True)
+                        catalog[code] = {
+                            "code": code,
+                            "title": meta.get("title", [code])[0],
+                            "credit_points": meta.get("creditPoints", ["10"])[0],
+                            "description": desc,
+                            "offerings": list(set(meta.get("nextOffering", []))),
+                            "career": meta.get("academicCareerName", ["Undergraduate"])[0],
+                            "group": meta.get("academicGrpDescription", ["Other"])[0],
+                            "subject_area": get_course_subject_area(code),
+                            "prereq_groups": fallback_groups,
+                            "prereq_display": format_prereq_display(fallback_groups),
+                            "min_cp_prereq": extract_cp_prereq("", "", desc),
+                            "coreqs": extract_coreqs(desc),
+                            "incompatibles": extract_incompatibles(desc),
+                            "program_restrictions": extract_program_restrictions(desc)
+                        }
+                print(f"[CATALOG LOADER] ✅ Successfully indexed {len(catalog)} courses in {time.time()-t0:.2f}s.", flush=True)
+                print("="*70 + "\n", flush=True)
+                return catalog
+            except Exception as e:
+                print(f"[CATALOG LOADER] Error parsing {local_path}: {e}", flush=True)
 
-            if resp.status_code == 200:
-                data = resp.json()
-                results = data.get("response", {}).get("resultPacket", {}).get("results", [])
-                total = data.get("response", {}).get("resultPacket", {}).get("resultsSummary", {}).get("totalMatching", 0)
-                print(f"[CATALOG LOADER] -> Found {len(results)} items in first page (Total available: {total})", flush=True)
-                if results:
-                    working_base = attempt_url
-                    break
-            else:
-                print(f"[CATALOG LOADER] -> Non-200 response body sample: {resp.text[:250]}", flush=True)
-        except Exception as e:
-            print(f"[CATALOG LOADER] -> Connection failed: {e}", flush=True)
+    # 2. Live network attempt
+    url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&query=!padrenull&sort=metafborderna&num_ranks=500&start_rank=1"
+    print(f"[CATALOG LOADER] Attempting live network fetch from:\n  -> {url}", flush=True)
+    t0 = time.time()
+    status_code, response_data = cloudflare_safe_get(url, timeout=12)
+    print(f"[CATALOG LOADER] Live HTTP Status: {status_code} ({time.time()-t0:.2f}s)", flush=True)
 
-    if not working_base:
-        print("[CATALOG LOADER] ❌ ERROR: All catalog endpoints failed. Returning empty catalog.", flush=True)
-        return {}
+    if status_code == 200 and isinstance(response_data, dict):
+        results = response_data.get("response", {}).get("resultPacket", {}).get("results", [])
+        for item in results:
+            meta = item.get("listMetadata", {})
+            cat_numbers = meta.get("categoryNumber", [])
+            if not cat_numbers:
+                continue
+            code = str(cat_numbers[0]).replace(" ", "").upper().strip()
+            desc = meta.get("description", [""])[0] or ""
+            catalog[code] = {
+                "code": code,
+                "title": meta.get("title", [code])[0],
+                "credit_points": meta.get("creditPoints", ["10"])[0],
+                "description": desc,
+                "offerings": list(set(meta.get("nextOffering", []))),
+                "career": meta.get("academicCareerName", ["Undergraduate"])[0],
+                "group": meta.get("academicGrpDescription", ["Other"])[0],
+                "subject_area": get_course_subject_area(code),
+                "prereq_groups": parse_rule_definition_to_groups("", desc),
+                "prereq_display": format_prereq_display(parse_rule_definition_to_groups("", desc)),
+                "min_cp_prereq": extract_cp_prereq("", "", desc),
+                "coreqs": extract_coreqs(desc),
+                "incompatibles": extract_incompatibles(desc),
+                "program_restrictions": extract_program_restrictions(desc)
+            }
+        print(f"[CATALOG LOADER] ✅ Live network fetch loaded {len(catalog)} courses.", flush=True)
+        print("="*70 + "\n", flush=True)
+        return catalog
 
-    # Paginate through results
-    for page in range(1, 16):  # 15 iterations x 250 covers up to 3,750 courses
-        paginated_url = f"{working_base}&start_rank={start_rank}"
-        print(f"[CATALOG LOADER] Page {page}: Fetching start_rank={start_rank}...", flush=True)
-        try:
-            resp = requests.get(paginated_url, headers=BROWSER_HEADERS, timeout=20)
-            if resp.status_code != 200:
-                print(f"[CATALOG LOADER] Page {page} returned status {resp.status_code}. Stopping pagination.", flush=True)
-                break
-            
-            data = resp.json()
-            packet = data.get("response", {}).get("resultPacket", {})
-            results = packet.get("results", [])
-            total_matching = packet.get("resultsSummary", {}).get("totalMatching", 0)
-
-            if not results:
-                print(f"[CATALOG LOADER] No more results found at page {page}.", flush=True)
-                break
-
-            for item in results:
-                meta = item.get("listMetadata", {})
-                cat_numbers = meta.get("categoryNumber", [])
-                if not cat_numbers:
-                    continue
-                code = str(cat_numbers[0]).replace(" ", "").upper().strip()
-                title = meta.get("title", [code])[0]
-                cp = meta.get("creditPoints", ["10"])[0]
-                desc = meta.get("description", [""])[0] or ""
-                offerings = meta.get("nextOffering", [])
-                career = meta.get("academicCareerName", ["Undergraduate"])[0]
-                group = meta.get("academicGrpDescription", ["Other"])[0]
-
-                p_match = re.search(r'(?:pre-?requisite(?:s)?|advised prerequisite(?:s)?)\s*[:\-]?\s*([^.;\n]+)', desc, re.I)
-                p_text = p_match.group(1) if p_match and "nil" not in p_match.group(1).lower() else ""
-                fallback_groups = parse_rule_definition_to_groups("", p_text)
-                min_cp = extract_cp_prereq("", "", desc)
-                prog_restrictions = extract_program_restrictions(desc)
-                subject_area = get_course_subject_area(code)
-
-                catalog[code] = {
-                    "code": code,
-                    "title": title,
-                    "credit_points": cp,
-                    "description": desc,
-                    "offerings": list(set(offerings)),
-                    "career": career,
-                    "group": group,
-                    "subject_area": subject_area,
-                    "prereq_groups": fallback_groups,
-                    "prereq_display": format_prereq_display(fallback_groups),
-                    "min_cp_prereq": min_cp,
-                    "coreqs": extract_coreqs(desc),
-                    "incompatibles": extract_incompatibles(desc),
-                    "program_restrictions": prog_restrictions
-                }
-
-            print(f"[CATALOG LOADER] Processed page {page} (+{len(results)} items) -> Total parsed so far: {len(catalog)}", flush=True)
-            start_rank += len(results)
-            if start_rank > total_matching:
-                print(f"[CATALOG LOADER] Reached end of catalog (start_rank {start_rank} > total {total_matching}).", flush=True)
-                break
-        except Exception as e:
-            print(f"[CATALOG LOADER] Exception during pagination at start_rank {start_rank}: {e}", flush=True)
-            traceback.print_exc()
-            break
-
-    print(f"[CATALOG LOADER] ✅ FINISHED: Successfully loaded {len(catalog)} total courses.", flush=True)
+    print(f"[CATALOG LOADER] ⚠️ Could not reach Funnelback on Cloudflare (HTTP {status_code}).", flush=True)
+    print(f"[CATALOG LOADER] 💡 TIP: Download courses.json via browser and commit to your repo to load all 3,000 courses.", flush=True)
     print("="*70 + "\n", flush=True)
     return catalog
 
@@ -940,6 +925,7 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
             "active_terms_per_year": {y: [1, 2] for y in range(1, duration_years + 1)}
         }
 
+    print(f"\n[DEGREE RULES] Parsing program rules for Degree {degree_code}...", flush=True)
     mapped = rules_json.get("mappedData", {}).get("components", {})
     struct_val = mapped.get("progRuleStruct", {}).get("value", {})
     struct_body = struct_val.get("body", [])
@@ -949,20 +935,29 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
     target_study_plan_comp = mapped.get("progRuleStdyPlan", {})
 
     clean_camp_pref = normalize_campus_name(campus_preference) if campus_preference else ""
-
     chosen_plan = None
     first_fallback_plan = None
 
     for item in struct_body:
         if isinstance(item, dict):
-            if "core" in str(item.get("title", "")).lower():
-                target_core_data = item.get("data", [])
-            if "flexible" in str(item.get("title", "")).lower():
-                target_flex_data = item.get("data", [])
+            item_title = str(item.get("title", "")).lower()
+            print(f"[DEGREE RULES] Found structure section: '{item.get('title')}' with {len(item.get('data', []))} data entries", flush=True)
+
+            if "core" in item_title:
+                target_core_data.extend(item.get("data", []))
+            
+            # Match Flexible, Elective, Option, Major, and Listed course containers
+            if any(k in item_title for k in ["flexible", "elective", "option", "major", "listed"]):
+                target_flex_data.extend(item.get("data", []))
                 has_flexible_module = True
 
             body_sub = item.get("body", [])
             for sub in body_sub:
+                sub_title = str(sub.get("title", "")).lower()
+                if any(k in sub_title for k in ["flexible", "elective", "option", "major", "listed"]):
+                    target_flex_data.extend(sub.get("data", []))
+                    has_flexible_module = True
+
                 prog_plan = sub.get("programPlan", {})
                 if prog_plan:
                     if not first_fallback_plan:
@@ -981,18 +976,33 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
     if chosen_plan:
         plan_struct = chosen_plan.get("progRuleStruct", {}).get("body", [])
         for p_item in plan_struct:
-            if "core" in str(p_item.get("title", "")).lower():
-                target_core_data = p_item.get("data", [])
-            if "flexible" in str(p_item.get("title", "")).lower():
-                target_flex_data = p_item.get("data", [])
+            p_title = str(p_item.get("title", "")).lower()
+            if "core" in p_title:
+                target_core_data.extend(p_item.get("data", []))
+            if any(k in p_title for k in ["flexible", "elective", "option", "major", "listed"]):
+                target_flex_data.extend(p_item.get("data", []))
                 has_flexible_module = True
         target_study_plan_comp = chosen_plan.get("progRuleStdyPlan", {})
 
+    # Extract all flexible/elective course codes
     for entry in target_flex_data:
+        # Check listOr
         for x in entry.get("listOr", []):
-            f_code = str(x.get("code", "")).replace(" ", "").upper()
-            if f_code and f_code not in flexible_module_courses:
-                flexible_module_courses.append(f_code)
+            if isinstance(x, dict):
+                for k in ["code", "courseCode", "itemCode"]:
+                    f_code = str(x.get(k, "")).replace(" ", "").upper()
+                    if f_code and re.search(r'\d{4}[A-Z]{3,4}', f_code):
+                        if f_code not in flexible_module_courses:
+                            flexible_module_courses.append(f_code)
+        # Check direct code properties on entry
+        if isinstance(entry, dict):
+            for k in ["code", "courseCode", "itemCode"]:
+                f_code = str(entry.get(k, "")).replace(" ", "").upper()
+                if f_code and re.search(r'\d{4}[A-Z]{3,4}', f_code):
+                    if f_code not in flexible_module_courses:
+                        flexible_module_courses.append(f_code)
+
+    print(f"[DEGREE RULES] ✅ Extracted {len(flexible_module_courses)} flexible/elective courses from rules: {flexible_module_courses[:8]}", flush=True)
 
     seen_codes = set()
     for entry in target_core_data:
@@ -2132,7 +2142,12 @@ elif st.session_state.plan:
 # -----------------------------------------------------------------------------
 if st.session_state.get("selected_degree"):
     with st.expander("💡 Elective & University Course Explorer (Full Catalog)", expanded=False):
-        st.write("Browse and filter across the complete Griffith course catalog. Automatically checks prerequisite & 80CP eligibility across your entire degree plan:")
+        print("\n" + "="*70, flush=True)
+        print("[EXPLORER TRACE] Opening Course Explorer...", flush=True)
+        print(f"[EXPLORER TRACE] In-memory catalog size: {len(catalog)} courses", flush=True)
+
+        deg_flex_list = st.session_state.get("degree_flex_courses", [])
+        print(f"[EXPLORER TRACE] Degree recommended flexible courses: {len(deg_flex_list)} ({deg_flex_list[:6]})", flush=True)
 
         if "sug_page" not in st.session_state:
             st.session_state.sug_page = 1
@@ -2146,7 +2161,7 @@ if st.session_state.get("selected_degree"):
         seen_cand = set()
 
         # 1. Degree Recommended Flexible Courses (Placed First)
-        for f_code in st.session_state.get("degree_flex_courses", []):
+        for f_code in deg_flex_list:
             if f_code not in core_set and f_code not in planned_or_held and f_code not in seen_cand:
                 info = catalog.get(f_code) or lookup_course(f_code) or {}
                 if info and info.get("code"):
@@ -2155,16 +2170,25 @@ if st.session_state.get("selected_degree"):
                     candidates.append(c_copy)
                     seen_cand.add(f_code)
 
+        print(f"[EXPLORER TRACE] Candidates from degree flexible module: {len(candidates)}", flush=True)
+
         # 2. Universal Course Catalog across all faculties (e.g. ALL MSC, ESC, NSC courses)
+        catalog_candidates_count = 0
         for c_code, c_info in catalog.items():
             if c_code not in core_set and c_code not in planned_or_held and c_code not in seen_cand:
                 career = str(c_info.get("career", "")).lower()
-                # Exclude postgraduate-only or research theses for undergraduate planners
                 if "postgrad" not in career and "research" not in career:
                     c_copy = dict(c_info)
                     c_copy["is_degree_recommended"] = False
                     candidates.append(c_copy)
                     seen_cand.add(c_code)
+                    catalog_candidates_count += 1
+
+        print(f"[EXPLORER TRACE] Additional candidates added from full catalog: {catalog_candidates_count}", flush=True)
+        print(f"[EXPLORER TRACE] Total candidate pool before filters: {len(candidates)} courses", flush=True)
+
+        if len(catalog) == 0:
+            st.warning("⚠️ Full university catalog is running in offline mode. Commit `courses.json` to your GitHub repo to unlock all 3,000 electives across all faculties.")
 
         # Evaluate Whole-Degree Prerequisite Satisfaction & CP requirements
         candidate_evaluations = []
@@ -2184,6 +2208,9 @@ if st.session_state.get("selected_degree"):
                 "level": lvl_lbl,
                 "subject_area": subj_area
             })
+
+        print(f"[EXPLORER TRACE] Prerequisite evaluation complete for {len(candidate_evaluations)} courses.", flush=True)
+        print("="*70 + "\n", flush=True)
 
         # --- MULTISELECT CONTROLS & FILTER BAR ---
         col_f1, col_f2, col_f3 = st.columns([1.8, 1.3, 1.4])
