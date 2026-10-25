@@ -76,16 +76,57 @@ def extract_course_codes(text: str):
     matches = re.findall(pattern, text)
     return list(dict.fromkeys(m.upper() for m in matches))
 
-def extract_prereqs(desc: str):
-    if not desc:
-        return []
-    match = re.search(r'(?:pre-?requisite(?:s)?|advised prerequisite(?:s)?|prior knowledge of)\s*[:\-]?\s*([^.;\n]+)', desc, re.I)
-    if match:
-        chunk = match.group(1)
-        if "nil" in chunk.lower() or "none" in chunk.lower():
-            return []
-        return extract_course_codes(chunk)
-    return []
+def parse_rule_definition_to_groups(rule_def: str, rule_sum: str = "") -> list:
+    """
+    Parses Curriculum API ruleDefinition like:
+    'COURSES (1) 1016MSC AND COURSES (1) 1014MSC, 1001AHS, 1001NSC'
+    Returns list of AND-groups: [{'count': 1, 'courses': ['1016MSC']}, {'count': 1, 'courses': ['1014MSC', '1001AHS', '1001NSC']}]
+    """
+    groups = []
+    text_to_parse = rule_def if (rule_def and "COURSES" in rule_def.upper()) else rule_sum
+    if not text_to_parse:
+        return groups
+
+    # Match COURSES (N) code1, code2... blocks
+    blocks = re.findall(r'COURSES\s*\((\d+)\)\s*([A-Z0-9,\s_]+?)(?=(?:AND\s+COURSES|OR\s+COURSES|$))', text_to_parse, re.I)
+    if blocks:
+        for count_str, code_str in blocks:
+            codes = extract_course_codes(code_str)
+            if codes:
+                groups.append({"count": int(count_str), "courses": codes})
+    else:
+        # Fallback for plain text rules e.g. "1014MSC or 1041SCG"
+        and_parts = re.split(r'\bAND\b', text_to_parse, flags=re.I)
+        for part in and_parts:
+            or_parts = re.split(r'\bOR\b|/', part, flags=re.I)
+            if len(or_parts) > 1:
+                codes = extract_course_codes(part)
+                if codes:
+                    groups.append({"count": 1, "courses": codes})
+            else:
+                codes = extract_course_codes(part)
+                for c in codes:
+                    groups.append({"count": 1, "courses": [c]})
+    return groups
+
+def format_prereq_display(prereq_groups: list) -> str:
+    """Formats structured prerequisite groups into human-readable AND/OR strings."""
+    if not prereq_groups:
+        return "No Prereqs"
+    group_strs = []
+    for g in prereq_groups:
+        c_list = g.get("courses", [])
+        if not c_list:
+            continue
+        if len(c_list) == 1:
+            group_strs.append(c_list[0])
+        else:
+            count = g.get("count", 1)
+            if count == 1:
+                group_strs.append(f"({' OR '.join(c_list)})")
+            else:
+                group_strs.append(f"({count} of: {' OR '.join(c_list)})")
+    return " AND ".join(group_strs) if group_strs else "No Prereqs"
 
 def extract_coreqs(desc: str):
     if not desc:
@@ -122,7 +163,7 @@ def format_offerings_label(offerings_list):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_full_catalog():
-    """Fetches all courses from Griffith search API."""
+    """Fetches courses from Griffith search API."""
     catalog = {}
     url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&num_ranks=3000&start_rank=1&sort=metafborderna"
     headers = {
@@ -147,6 +188,11 @@ def load_full_catalog():
                 career = meta.get("academicCareerName", ["Undergraduate"])[0]
                 group = meta.get("academicGrpDescription", ["Other"])[0]
 
+                # Fallback text parser for requisites
+                p_match = re.search(r'(?:pre-?requisite(?:s)?|advised prerequisite(?:s)?|prior knowledge of)\s*[:\-]?\s*([^.;\n]+)', desc, re.I)
+                p_text = p_match.group(1) if p_match and "nil" not in p_match.group(1).lower() else ""
+                fallback_groups = parse_rule_definition_to_groups("", p_text)
+
                 catalog[code] = {
                     "code": code,
                     "title": title,
@@ -155,7 +201,8 @@ def load_full_catalog():
                     "offerings": list(set(offerings)),
                     "career": career,
                     "group": group,
-                    "prereqs": extract_prereqs(desc),
+                    "prereq_groups": fallback_groups,
+                    "prereq_display": format_prereq_display(fallback_groups),
                     "coreqs": extract_coreqs(desc),
                     "incompatibles": extract_incompatibles(desc)
                 }
@@ -178,7 +225,6 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
         primary_term = "3261"
 
     terms_to_try = [primary_term] + [t for t in ["3261", "3265", "3268"] if t != primary_term]
-
     current_year = datetime.now().year
     search_year = min(selected_year, current_year)
     years_to_try = [search_year, search_year - 1]
@@ -199,27 +245,35 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     data = resp.json()
                     mapped = data.get("mappedData", {}).get("components", {})
 
-                    prereqs, coreqs, incompatibles = [], [], []
+                    prereq_groups, coreqs, incompatibles = [], [], []
                     req_obj = mapped.get("crseRequiste", {}).get("value", {})
                     if isinstance(req_obj, dict):
                         for r in req_obj.get("requisites", []):
                             rtype = str(r.get("type", "")).upper()
-                            combined_text = f"{r.get('ruleDefinition', '')} {r.get('ruleSummary', '')}"
-                            codes = extract_course_codes(combined_text)
+                            rule_def = str(r.get("ruleDefinition", ""))
+                            rule_sum = str(r.get("ruleSummary", ""))
+                            
                             if "PRE" in rtype:
-                                prereqs.extend(codes)
+                                groups = parse_rule_definition_to_groups(rule_def, rule_sum)
+                                # Filter out self-referencing codes
+                                clean_groups = []
+                                for g in groups:
+                                    filtered_codes = [c for c in g.get("courses", []) if c != clean_code]
+                                    if filtered_codes:
+                                        clean_groups.append({"count": min(g.get("count", 1), len(filtered_codes)), "courses": filtered_codes})
+                                if clean_groups:
+                                    prereq_groups.extend(clean_groups)
                             elif "CO" in rtype:
-                                coreqs.extend(codes)
+                                coreqs.extend([c for c in extract_course_codes(f"{rule_def} {rule_sum}") if c != clean_code])
                             elif "ANTI" in rtype:
-                                incompatibles.extend(codes)
+                                incompatibles.extend([c for c in extract_course_codes(f"{rule_def} {rule_sum}") if c != clean_code])
 
                     other_req = mapped.get("crseOthrRequiste", {}).get("value")
                     if other_req and isinstance(other_req, str):
-                        prereqs.extend(extract_course_codes(other_req))
-
-                    prereqs = [p for p in dict.fromkeys(prereqs) if p != clean_code]
-                    coreqs = [c for c in dict.fromkeys(coreqs) if c != clean_code]
-                    incompatibles = [i for i in dict.fromkeys(incompatibles) if i != clean_code]
+                        other_codes = [c for c in extract_course_codes(other_req) if c != clean_code]
+                        if other_codes and not prereq_groups:
+                            for oc in other_codes:
+                                prereq_groups.append({"count": 1, "courses": [oc]})
 
                     final_offerings = list(catalog_offerings)
                     if not final_offerings:
@@ -248,9 +302,10 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                         "offerings": list(dict.fromkeys(final_offerings)),
                         "career": data.get("subtype", "Undergraduate"),
                         "group": data.get("orgParent", "Other"),
-                        "prereqs": prereqs,
-                        "coreqs": coreqs,
-                        "incompatibles": incompatibles
+                        "prereq_groups": prereq_groups,
+                        "prereq_display": format_prereq_display(prereq_groups),
+                        "coreqs": list(dict.fromkeys(coreqs)),
+                        "incompatibles": list(dict.fromkeys(incompatibles))
                     }
             except Exception:
                 continue
@@ -279,7 +334,6 @@ def lookup_course(clean_code: str, selected_year: int = None):
 # 2B. LIVE DEGREE SEARCH & CURRICULUM RULES PARSER
 # -----------------------------------------------------------------------------
 def get_fallback_degrees():
-    """Provides fallback degree programs in case of connection limits."""
     return [
         {"code": "1031", "title": "Bachelor of Biomedical Science", "campuses": ["Brisbane South", "Nathan"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate"},
         {"code": "1094", "title": "Bachelor of Biomedical Science", "campuses": ["Gold Coast"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate"},
@@ -582,7 +636,7 @@ def is_course_offered_in_term(c_info: dict, trimester: int) -> bool:
     return False
 
 # -----------------------------------------------------------------------------
-# 4. PLAN VALIDATION ENGINE
+# 4. PLAN VALIDATION ENGINE (SUPPORTING BOOLEAN AND / OR PRE-REQS)
 # -----------------------------------------------------------------------------
 def term_index(year: int, trimester: int) -> int:
     return (year - 1) * 3 + trimester
@@ -604,7 +658,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
             c_warns = []
             c_sats = []
             info = catalog_dict.get(c) or lookup_course(c) or {}
-            prereqs = info.get("prereqs", [])
+            prereq_groups = info.get("prereq_groups", [])
             coreqs = info.get("coreqs", [])
             incomps = info.get("incompatibles", [])
 
@@ -612,16 +666,36 @@ def validate_plan(plan: dict, catalog_dict: dict):
             if not is_course_offered_in_term(info, tr):
                 c_warns.append(f"Not usually offered in Trimester {tr}")
 
-            # 2. Prerequisite Check
-            for p in prereqs:
-                if p not in placed_coords:
-                    c_warns.append(f"Missing Prerequisite: {p}")
-                else:
-                    p_yr, p_tr = placed_coords[p]
-                    if term_index(p_yr, p_tr) < current_rank:
-                        c_sats.append(f"Prerequisite satisfied: {p} (completed in Year {p_yr} T{p_tr})")
+            # 2. Prerequisite Check with AND / OR Evaluation
+            for group in prereq_groups:
+                g_courses = group.get("courses", [])
+                count_needed = group.get("count", 1)
+
+                satisfied_courses = []
+                same_or_later_courses = []
+
+                for p in g_courses:
+                    if p in placed_coords:
+                        p_yr, p_tr = placed_coords[p]
+                        if term_index(p_yr, p_tr) < current_rank:
+                            satisfied_courses.append((p, p_yr, p_tr))
+                        else:
+                            same_or_later_courses.append((p, p_yr, p_tr))
+
+                if len(satisfied_courses) >= count_needed:
+                    sat_desc = ", ".join([f"{sc[0]} (completed Year {sc[1]} T{sc[2]})" for sc in satisfied_courses[:count_needed]])
+                    c_sats.append(f"Prerequisite satisfied: {sat_desc}")
+                elif same_or_later_courses:
+                    sample = same_or_later_courses[0]
+                    if len(g_courses) == 1:
+                        c_warns.append(f"Prereq {sample[0]} must be completed before Year {yr} T{tr} (currently scheduled in Year {sample[1]} T{sample[2]})")
                     else:
-                        c_warns.append(f"Prereq {p} must be completed before Year {yr} T{tr}")
+                        c_warns.append(f"Prereq ({' OR '.join(g_courses)}) must be completed before Year {yr} T{tr}")
+                else:
+                    if len(g_courses) == 1:
+                        c_warns.append(f"Missing Prerequisite: {g_courses[0]}")
+                    else:
+                        c_warns.append(f"Missing Prerequisite: Complete at least {count_needed} of ({' OR '.join(g_courses)})")
 
             # 3. Corequisite Check
             for cr in coreqs:
@@ -945,7 +1019,8 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         background: transparent;
         margin: 0;
         padding: 0;
-        overflow: hidden !important;
+        overflow-y: auto !important;
+        overflow-x: hidden !important;
     }
 
     * {
@@ -959,7 +1034,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         padding: 16px 20px;
         box-shadow: 0 4px 18px rgba(0, 0, 0, 0.25);
         margin-bottom: 20px;
-        overflow: visible !important;
     }
 
     .section-title {
@@ -1109,23 +1183,38 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         100% { box-shadow: 0 0 6px rgba(255, 71, 87, 0.5); }
     }
 
+    /* Scrollable, Responsive Holding Grid (Prevents Overflow & Card Clipping) */
     .holding-grid {
         display: grid;
-        grid-template-columns: repeat(auto-fill, 230px);
+        grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
         gap: 12px;
-        min-height: 60px;
+        max-height: 330px;
+        overflow-y: auto !important;
         padding: 12px;
         background: rgba(0, 0, 0, 0.25);
         border: 1px dashed var(--border-color);
         border-radius: 8px;
-        overflow: visible !important;
+    }
+
+    .holding-grid::-webkit-scrollbar {
+        width: 7px;
+    }
+    .holding-grid::-webkit-scrollbar-track {
+        background: rgba(0, 0, 0, 0.2);
+        border-radius: 4px;
+    }
+    .holding-grid::-webkit-scrollbar-thumb {
+        background: rgba(255, 255, 255, 0.25);
+        border-radius: 4px;
+    }
+    .holding-grid::-webkit-scrollbar-thumb:hover {
+        background: rgba(255, 255, 255, 0.4);
     }
     
     .year-container {
         margin-top: 14px;
         border: 1px solid var(--border-color);
         border-radius: 8px;
-        overflow: visible !important;
     }
 
     .year-heading {
@@ -1141,7 +1230,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         display: flex;
         width: 100%;
         background: rgba(0, 0, 0, 0.15);
-        overflow: visible !important;
     }
 
     .trim-col {
@@ -1149,7 +1237,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         border-right: 1px solid var(--border-color);
         padding: 12px;
         box-sizing: border-box;
-        overflow: visible !important;
     }
 
     .trim-col:last-child {
@@ -1216,12 +1303,12 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         html += "<div style='color: rgba(255,255,255,0.4); font-size: 12px; grid-column: 1/-1;'>No courses in holding zone. Add a course from the sidebar or select a degree program to begin planning.</div>"
 
     for code in holding_zone:
-        info = catalog_dict.get(code) or lookup_course(code) or {"title": code, "credit_points": "10", "offerings": [], "prereqs": [], "coreqs": [], "group": ""}
+        info = catalog_dict.get(code) or lookup_course(code) or {"title": code, "credit_points": "10", "offerings": [], "prereq_display": "No Prereqs", "group": ""}
         bg = string_to_pastel_hex(code)
         is_sel = "is-selected" if code == selected_code else ""
 
-        pr_text = f"Pre: {', '.join(info['prereqs'])}" if info["prereqs"] else "No Prereqs"
-        cr_text = f" | Co: {', '.join(info['coreqs'])}" if info["coreqs"] else ""
+        pr_text = f"Pre: {info.get('prereq_display', 'No Prereqs')}"
+        cr_text = f" | Co: {', '.join(info['coreqs'])}" if info.get("coreqs") else ""
         offs = format_offerings_label(info.get("offerings", []))
 
         or_badge = ""
@@ -1241,7 +1328,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                 <span class="badge-pill">{offs}</span>
                 {or_badge}
             </div>
-            <div style="font-size: 9px; opacity: 0.85; margin-top: 5px;">{pr_text}{cr_text}</div>
+            <div style="font-size: 9px; opacity: 0.9; margin-top: 5px; word-break: break-word;">{pr_text}{cr_text}</div>
         </div>
         """
 
@@ -1431,10 +1518,14 @@ if plan_warnings or plan_satisfied:
 elif st.session_state.plan:
     st.success("✅ All scheduled courses satisfy prerequisite, corequisite, and offering constraints.")
 
+# Accurately compute iframe height so both zones fit comfortably with full scrolling support
+holding_count = len(st.session_state.holding_zone)
+holding_rendered_height = 90 if holding_count == 0 else min(350, 70 + ((holding_count + 2) // 3) * 115)
+
 max_in_any_trim = max([len(v) for v in st.session_state.plan.values()] + [1])
-courses_render_factor = max_in_any_trim if max_in_any_trim == 7 else (max_in_any_trim + 1)
-year_block_height = 50 + (courses_render_factor * 85)
-calc_height = 250 + (num_years * year_block_height)
+courses_render_factor = max_in_any_trim if max_in_any_trim >= 4 else 4
+year_block_height = 65 + (courses_render_factor * 85)
+calc_height = holding_rendered_height + (num_years * year_block_height) + 220
 
 planner_html = build_planner_html(
     holding_zone=st.session_state.holding_zone,
@@ -1449,4 +1540,4 @@ planner_html = build_planner_html(
     course_or_map=st.session_state.course_or_map
 )
 
-components.html(planner_html, height=calc_height, scrolling=False)
+components.html(planner_html, height=calc_height, scrolling=True)
