@@ -2856,17 +2856,38 @@ if st.session_state.get("selected_degree"):
                     border-color: rgba(112, 161, 255, 0.6);
                     background: rgba(255, 255, 255, 0.05);
                 }
+                .tags-row {
+                    display: flex;
+                    align-items: center;
+                    flex-wrap: nowrap;
+                    gap: 6px;
+                    overflow-x: auto;
+                    white-space: nowrap;
+                    margin-top: 6px;
+                    margin-bottom: 6px;
+                    scrollbar-width: none; /* Firefox */
+                    -ms-overflow-style: none; /* IE/Edge */
+                }
+                .tags-row::-webkit-scrollbar {
+                    display: none; /* Chrome, Safari, Opera */
+                }
                 .tag-pill {
-                    display: inline-block;
-                    padding: 2px 8px;
+                    display: inline-flex;
+                    align-items: center;
+                    white-space: nowrap;
+                    flex-shrink: 0;
+                    padding: 2px 7px;
                     border-radius: 4px;
                     font-size: 10px;
                     font-weight: 700;
-                    margin-right: 5px;
+                    line-height: 1.3;
                 }
                 .tag-area { background: rgba(112, 161, 255, 0.18); color: #70a1ff; border: 1px solid rgba(112, 161, 255, 0.35); }
                 .tag-level { background: rgba(165, 94, 234, 0.18); color: #a55eea; border: 1px solid rgba(165, 94, 234, 0.35); }
                 .tag-off { background: rgba(255, 165, 2, 0.18); color: #ffa502; border: 1px solid rgba(255, 165, 2, 0.35); }
+                .tag-group { background: rgba(255, 255, 255, 0.08) !important; color: #d1d8e0 !important; border: 1px solid rgba(255, 255, 255, 0.15) !important; }
+
+                /* 100% Solid Non-Transparent Campus Badges */
                 .tag-campus { 
                     background: #00564d !important; 
                     color: #ffffff !important; 
@@ -2880,6 +2901,7 @@ if st.session_state.get("selected_degree"):
                     opacity: 1 !important;
                     box-shadow: 0 0 6px rgba(255, 77, 77, 0.6) !important;
                 }
+
                 .tag-cp { background: rgba(255, 255, 255, 0.1); color: #f1f2f6; }
                 .tag-rec { 
                     background: rgba(255, 215, 0, 0.25) !important; 
@@ -2922,7 +2944,7 @@ if st.session_state.get("selected_degree"):
                 rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if item["is_degree_recommended"] else ''
 
                 with st.container():
-                    c_main, c_btn = st.columns([5.3, 0.7])
+                    c_main, c_btn = st.columns([5.4, 0.6])
                     with c_main:
                         st.markdown(
                             f"""
@@ -2932,13 +2954,13 @@ if st.session_state.get("selected_degree"):
 {c_code} — {title} {rec_badge}
 </span>
 </div>
-<div style="margin-top:6px; margin-bottom:4px;">
+<div class="tags-row">
 <span class="tag-pill tag-area">{area_tag}</span>
 <span class="tag-pill tag-level">{lvl_tag}</span>
 <span class="tag-pill tag-cp">{cp} CP</span>
 <span class="tag-pill tag-off">Offerings: {offs}</span>
 {camp_tag_html}
-<span class="tag-pill" style="background:rgba(255,255,255,0.06); color:#a4b0be;">{c_info.get('group', 'General')}</span>
+<span class="tag-pill tag-group">{c_info.get('group', 'General')}</span>
 </div>
 <div class="{status_class}">
 {expl}
