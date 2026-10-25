@@ -1828,41 +1828,54 @@ elif st.session_state.plan:
 # --- ELECTIVE / FLEXIBLE MODULE SUGGESTIONS PANEL ---
 if st.session_state.get("selected_degree") and st.session_state.get("has_flexible_module", False):
     with st.expander("💡 Elective & Flexible Module Suggestions", expanded=False):
-        st.write("Browse recommended electives and courses across Griffith. Filter by discipline, level, or search keyword:")
-        
+        st.write("Browse recommended electives and courses across Griffith. Filter by discipline, level, or keyword:")
+
+        # Pagination & Filter Session State Setup
+        if "sug_page" not in st.session_state:
+            st.session_state.sug_page = 1
+
         core_set = {c["code"] for c in st.session_state.get("degree_core_courses", [])}
         planned_set = {c for clist in st.session_state.plan.values() for c in clist} | set(st.session_state.holding_zone)
-        
+
         candidates = []
         seen_cand = set()
 
-        # 1. Priority: Recommended flexible courses from the degree rules
+        # 1. Recommended flexible courses from degree rules
         for f_code in st.session_state.get("degree_flex_courses", []):
             if f_code not in core_set and f_code not in planned_set and f_code not in seen_cand:
                 info = catalog.get(f_code) or lookup_course(f_code) or {}
                 if info and info.get("code"):
+                    info["is_degree_recommended"] = True
                     candidates.append(info)
                     seen_cand.add(f_code)
-                    
-        # 2. General: Include all cached undergraduate courses from the catalog
+
+        # 2. Universal catalog: Search all undergraduate courses across Griffith
         for c_code, c_info in catalog.items():
             if c_code not in core_set and c_code not in planned_set and c_code not in seen_cand:
                 career = str(c_info.get("career", "")).lower()
-                # Exclude postgraduate/research to suggest valid undergraduate electives
                 if "postgrad" not in career and "research" not in career:
+                    c_info["is_degree_recommended"] = False
                     candidates.append(c_info)
                     seen_cand.add(c_code)
 
-        col_f1, col_f2, col_f3 = st.columns([2, 1.5, 2])
+        # Search & Filter Controls Bar
+        col_f1, col_f2, col_f3, col_f4 = st.columns([2.2, 1.4, 2, 1])
         with col_f1:
             all_groups = sorted(list(set(c.get("group", "Other") for c in candidates if c.get("group"))))
-            sel_group = st.selectbox("Filter Discipline / Academic Group", options=["All"] + all_groups, key="sug_filter_grp")
+            sel_group = st.selectbox("Discipline / Academic Group", options=["All"] + all_groups, key="sug_filter_grp")
         with col_f2:
-            sel_level = st.selectbox("Filter Course Level", options=["All", "Level 1 (1xxx)", "Level 2 (2xxx)", "Level 3 (3xxx)", "Level 4 (4xxx)"], key="sug_filter_lvl")
+            sel_level = st.selectbox("Course Level", options=["All", "Level 1 (1xxx)", "Level 2 (2xxx)", "Level 3 (3xxx)", "Level 4 (4xxx)"], key="sug_filter_lvl")
         with col_f3:
-            sug_keyword = st.text_input("Filter Keyword / Code", placeholder="e.g. data, ethics, 2020...", key="sug_filter_kw")
+            sug_keyword = st.text_input("Search Keyword / Code", placeholder="e.g. data, ethics, 2020...", key="sug_filter_kw")
+        with col_f4:
+            per_page = st.selectbox("Per Page", options=[10, 25, 50], index=0, key="sug_per_page")
 
-        # Apply filters
+        # Level helper
+        def get_level_digit(code_str):
+            m = re.search(r'\d', code_str)
+            return m.group(0) if m else "1"
+
+        # Apply Filters
         filtered_sug = []
         kw = sug_keyword.strip().lower()
         for c in candidates:
@@ -1870,29 +1883,64 @@ if st.session_state.get("selected_degree") and st.session_state.get("has_flexibl
             if sel_group != "All" and c.get("group") != sel_group:
                 continue
             if sel_level != "All":
-                lvl_digit = sel_level.split(" ")[1][0]
-                if not code[0].isdigit() or code[0] != lvl_digit:
+                target_lvl = sel_level.split(" ")[1][0]
+                if get_level_digit(code) != target_lvl:
                     continue
-            if kw and kw not in code.lower() and kw not in c.get("title", "").lower():
+            if kw and (kw not in code.lower() and kw not in c.get("title", "").lower()):
                 continue
             filtered_sug.append(c)
 
-        if not filtered_sug:
+        total_results = len(filtered_sug)
+
+        if total_results == 0:
             st.caption("No elective suggestions match the selected filters.")
         else:
-            st.caption(f"Showing top {min(15, len(filtered_sug))} of {len(filtered_sug)} matching courses:")
+            total_pages = max(1, (total_results + per_page - 1) // per_page)
+            st.session_state.sug_page = min(max(1, st.session_state.sug_page), total_pages)
+            curr_page = st.session_state.sug_page
+
+            start_idx = (curr_page - 1) * per_page
+            end_idx = min(start_idx + per_page, total_results)
+            page_items = filtered_sug[start_idx:end_idx]
+
+            # Header & Counter Bar
+            col_count, col_nav = st.columns([3, 2])
+            with col_count:
+                st.markdown(f"**Showing {start_idx + 1}–{end_idx} of {total_results:,} matching courses**")
+            with col_nav:
+                c_prev, c_txt, c_next = st.columns([1, 1.8, 1])
+                with c_prev:
+                    if st.button("⬅️ Prev", disabled=(curr_page <= 1), use_container_width=True, key="sug_prev_btn"):
+                        st.session_state.sug_page -= 1
+                        st.rerun()
+                with c_txt:
+                    st.markdown(f"<div style='text-align:center; padding-top:4px; font-weight:600; font-size:12px;'>Page {curr_page} of {total_pages}</div>", unsafe_allow_html=True)
+                with c_next:
+                    if st.button("Next ➡️", disabled=(curr_page >= total_pages), use_container_width=True, key="sug_next_btn"):
+                        st.session_state.sug_page += 1
+                        st.rerun()
+
+            st.write("")
             placed_coords = {c: (yr, tr) for (yr, tr), clist in st.session_state.plan.items() for c in clist}
 
-            for c_info in filtered_sug[:15]:
+            # Modern Table Rows
+            for c_info in page_items:
                 c_code = c_info["code"]
                 title = c_info["title"]
                 cp = c_info.get("credit_points", "10")
                 offs = format_offerings_label(c_info.get("offerings", []))
                 p_groups = c_info.get("prereq_groups", [])
 
-                # Calculate prerequisite readiness
-                prereq_status_str = "✅ No Prerequisites • Ready for Y1 T1"
-                if p_groups:
+                # Check Incompatibles
+                incomps = c_info.get("incompatibles", [])
+                has_incomp = any(inc in placed_coords for inc in incomps)
+
+                # Determine Readiness
+                prereq_status_str = "✅ Ready for Y1 T1 (No prereqs)"
+                if has_incomp:
+                    clashing_inc = next(inc for inc in incomps if inc in placed_coords)
+                    prereq_status_str = f"🚫 Incompatible with {clashing_inc} in your plan"
+                elif p_groups:
                     latest_term = 0
                     all_sat = True
                     for g in p_groups:
@@ -1916,15 +1964,18 @@ if st.session_state.get("selected_degree") and st.session_state.get("has_flexibl
                     else:
                         prereq_status_str = f"⏳ Prereqs needed: {format_prereq_display(p_groups)}"
 
-                col_info, col_btn = st.columns([4.2, 0.8])
-                with col_info:
-                    st.markdown(f"**{c_code}** — {title} (`{cp} CP` • `{offs}`)")
-                    st.caption(f"{prereq_status_str} | *{c_info.get('group', 'General')}*")
-                with col_btn:
-                    if st.button("➕ Add", key=f"add_sug_{c_code}", use_container_width=True):
-                        if c_code not in st.session_state.holding_zone:
-                            st.session_state.holding_zone.append(c_code)
-                        st.rerun()
+                rec_badge = " ⭐ Recommended Elective" if c_info.get("is_degree_recommended") else ""
+
+                with st.container(border=True):
+                    c_main, c_btn = st.columns([5.2, 0.8])
+                    with c_main:
+                        st.markdown(f"**{c_code}** — {title} &nbsp;<span style='color:#e67e22; font-size:11px; font-weight:700;'>{rec_badge}</span>", unsafe_allow_html=True)
+                        st.caption(f"**{cp} CP** • Offering: `{offs}` • Group: *{c_info.get('group', 'General')}* • {prereq_status_str}")
+                    with c_btn:
+                        if st.button("➕ Add", key=f"add_sug_{c_code}", use_container_width=True, help="Add to Course Holding Zone"):
+                            if c_code not in st.session_state.holding_zone:
+                                st.session_state.holding_zone.append(c_code)
+                            st.rerun()
 
 holding_count = len(st.session_state.holding_zone)
 holding_rendered_height = 80 if holding_count == 0 else min(310, 60 + ((holding_count + 2) // 3) * 115)
