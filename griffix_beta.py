@@ -1329,21 +1329,26 @@ def validate_plan(plan: dict, catalog_dict: dict):
 
     return warnings, satisfied
 
-def check_course_incompatibilities(c_info: dict, all_planned_or_held: set, catalog_dict: dict) -> list:
+def check_course_incompatibilities(c_info: dict, all_planned_or_held: set = None, catalog_dict: dict = None) -> list:
     """
     Bidirectional incompatibility check:
     1. Does c_info list any scheduled/held course as incompatible (e.g. 2003MSC)?
     2. Does any scheduled/held course list c_info as incompatible?
     """
+    if catalog_dict is None:
+        catalog_dict = catalog
+    if all_planned_or_held is None:
+        all_planned_or_held = set(c for clist in st.session_state.get("plan", {}).values() for c in clist) | set(st.session_state.get("holding_zone", []))
+
     code = c_info.get("code")
     incomp_issues = []
 
-    # Forward check
+    # Forward check: c_info's listed incompatibles
     for inc in c_info.get("incompatibles", []):
         if inc in all_planned_or_held and inc != code:
             incomp_issues.append(f"Incompatible with {inc}")
 
-    # Reverse check
+    # Reverse check: does any planned/held course list 'code' as incompatible?
     for planned_c in all_planned_or_held:
         if planned_c == code:
             continue
@@ -1356,8 +1361,18 @@ def check_course_incompatibilities(c_info: dict, all_planned_or_held: set, catal
     return incomp_issues
 
 
-def is_course_degree_compatible(c_info: dict, sel_deg_code: str, all_planned_or_held: set, catalog_dict: dict) -> tuple[bool, str]:
-    """Fully generalized check: degree program restrictions and bidirectional anti-requisites."""
+def is_course_degree_compatible(c_info: dict, sel_deg_code: str = None, all_planned_or_held: set = None, catalog_dict: dict = None) -> tuple[bool, str]:
+    """
+    Fully generalized check: degree program restrictions and bidirectional anti-requisites.
+    Accepts 1, 2, 3, or 4 arguments safely.
+    """
+    if catalog_dict is None:
+        catalog_dict = catalog
+    if sel_deg_code is None and st.session_state.get("selected_degree"):
+        sel_deg_code = st.session_state.selected_degree.get("code")
+    if all_planned_or_held is None:
+        all_planned_or_held = set(c for clist in st.session_state.get("plan", {}).values() for c in clist) | set(st.session_state.get("holding_zone", []))
+
     code = c_info.get("code", "")
 
     # 1. Program restriction check (e.g. 1000DOH restricted to 1613)
