@@ -10,7 +10,7 @@ import urllib.parse
 from datetime import datetime
 
 st.warning("**IMPORTANT**: THIS SITE IS A BETA VERSION OF GRIFFIX FEATURES, AND ONLY INCLUDES **EXPERIMENTAL FEATURES UNDERGOING TESTING**. ACCESS THE OFFICIAL VERSION OF GRIFFIX [HERE](https://griffix.streamlit.app)")
-
+st.error("**WARNING**: THIS SITE DOES **NOT** SAVE WHAT YOU HAVE ON YOUR SCREEN AFTER YOU REFRESH OR CLOSE THE PAGE.")
 # -----------------------------------------------------------------------------
 # 1. PAGE CONFIGURATION & STATE
 # -----------------------------------------------------------------------------
@@ -81,7 +81,7 @@ if "include_t3_cb" not in st.session_state:
     st.session_state.include_t3_cb = True
 
 # -----------------------------------------------------------------------------
-# 2. CAMPUS NORMALIZATION
+# 2. CAMPUS NORMALIZATION & CODE HELPERS
 # -----------------------------------------------------------------------------
 def normalize_campus_name(name: str) -> str:
     """Unifies campus naming so Brisbane South/Nathan and Brisbane City/South Bank merge."""
@@ -101,36 +101,75 @@ def normalize_campus_name(name: str) -> str:
         return "Online"
     return n
 
+def get_course_subject_area(code_str: str) -> str:
+    """Extracts discipline suffix/prefix like MSC, ESC, NSC, ENG, CCJ, IBA."""
+    if not code_str:
+        return "OTHER"
+    clean = code_str.replace(" ", "").upper()
+    m = re.search(r'[A-Z]{3,4}', clean)
+    return m.group(0) if m else "OTHER"
+
+def get_course_level_label(code_str: str) -> str:
+    """Identifies course level from the first digit (e.g. 1014MSC -> Level 1)."""
+    m = re.search(r'\d', code_str)
+    if not m:
+        return "Other Level"
+    d = int(m.group(0))
+    if d == 1:
+        return "Level 1 (1xxx)"
+    elif d == 2:
+        return "Level 2 (2xxx)"
+    elif d == 3:
+        return "Level 3 (3xxx)"
+    elif d == 4:
+        return "Level 4 (4xxx)"
+    elif d >= 5:
+        return "Level 5+ (5xxx+)"
+    return "Other Level"
+
 # -----------------------------------------------------------------------------
-# 3. REQUISITES & OFFERINGS PARSER (AND / OR AWARE, NO FALSE PRE-REQS)
+# 3. REQUISITES & OFFERINGS PARSER
 # -----------------------------------------------------------------------------
 def extract_course_codes(text: str):
     """Finds valid Griffith course codes."""
     if not text:
         return []
-    pattern = r'\b(?:[0-9]{4}[A-Z]{3,4}(?:_[A-Z0-9]+)?|[A-Z]{3}[0-9]{3})\b'
+    pattern = r'\b(?:[0-9]{4}[A-Z]{3,4}(?:_[A-Z0-9]+)?|[A-Z]{3,4}[0-9]{3,4})\b'
     matches = re.findall(pattern, text)
     return list(dict.fromkeys(m.upper() for m in matches))
 
+def extract_program_restrictions(desc: str) -> list:
+    """Extracts 4-digit program degree code restrictions from requisites."""
+    if not desc:
+        return []
+    patterns = [
+        r'must be undertaking\s+([0-9]{4})',
+        r'must be enrolled in\s+(?:the\s+)?([0-9]{4})',
+        r'enrolled in\s+(?:program\s+)?([0-9]{4})',
+        r'restricted to\s+(?:students in\s+)?(?:program\s+)?([0-9]{4})',
+        r'program\s+([0-9]{4})\s+students',
+    ]
+    restricted = []
+    for pat in patterns:
+        for match in re.finditer(pat, desc, re.I):
+            c = match.group(1)
+            if c not in restricted:
+                restricted.append(c)
+    return restricted
+
 def parse_rule_definition_to_groups(rule_def: str, rule_sum: str = "") -> list:
-    """
-    Parses Curriculum API ruleDefinition accurately:
-    - 'COURSES (1) 1017MSC OR COURSES (1) 1006MSC' -> 1 group: count 1, courses: ['1017MSC', '1006MSC']
-    - 'COURSES (1) 1016MSC AND COURSES (1) 1014MSC, 1001AHS, 1001NSC' -> 2 groups: ['1016MSC'] AND ['1014MSC', '1001AHS', '1001NSC']
-    """
+    """Parses Curriculum API ruleDefinition accurately into AND / OR course groups."""
     groups = []
     text_to_parse = rule_def if (rule_def and "COURSES" in rule_def.upper()) else rule_sum
     if not text_to_parse:
         return groups
 
-    # Split top-level by AND clauses first
     and_clauses = re.split(r'\s+AND\s+', text_to_parse, flags=re.I)
     for clause in and_clauses:
         clause = clause.strip()
         if not clause:
             continue
 
-        # Check if clause contains OR choices
         or_subclauses = re.split(r'\s+OR\s+|/', clause, flags=re.I)
         all_codes_in_clause = []
         min_count = 1
@@ -154,7 +193,7 @@ def parse_rule_definition_to_groups(rule_def: str, rule_sum: str = "") -> list:
     return groups
 
 def format_prereq_display(prereq_groups: list) -> str:
-    """Formats structured prerequisite groups into clean, human-readable AND / OR strings."""
+    """Formats structured prerequisite groups into human-readable strings."""
     if not prereq_groups:
         return "No Prereqs"
     group_strs = []
@@ -225,22 +264,30 @@ def is_course_offered_in_term(c_info: dict, trimester: int) -> bool:
     return False
 
 # -----------------------------------------------------------------------------
-# 5. CATALOG & LIVE CURRICULUM LOOKUP (SAFE FROM REQUISITE CONTAMINATION)
+# 5. FULL CATALOG LOADER (PAGINATED FOR COMPLETE ~2,700+ COURSES)
 # -----------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_full_catalog():
-    """Fetches all courses from Griffith search API."""
+    """Fetches ALL ~2,727 courses across Griffith using Funnelback pagination."""
     catalog = {}
-    url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&num_ranks=3000&start_rank=1&sort=metafborderna"
     headers = {
         'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
         'Accept': 'application/json, text/plain, */*'
     }
-    try:
-        resp = requests.get(url, headers=headers, timeout=20)
-        if resp.status_code == 200:
+    base_url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&num_ranks=800&sort=metafborderna"
+    start_rank = 1
+
+    for _ in range(6):  # 6 iterations x 800 covers up to 4,800 courses
+        url = f"{base_url}&start_rank={start_rank}"
+        try:
+            resp = requests.get(url, headers=headers, timeout=25)
+            if resp.status_code != 200:
+                break
             data = resp.json()
             results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+            if not results:
+                break
+
             for item in results:
                 meta = item.get("listMetadata", {})
                 cat_numbers = meta.get("categoryNumber", [])
@@ -254,10 +301,12 @@ def load_full_catalog():
                 career = meta.get("academicCareerName", ["Undergraduate"])[0]
                 group = meta.get("academicGrpDescription", ["Other"])[0]
 
-                # Isolate prerequisites safely from description
+                # Parse Requisites & Restrictions
                 p_match = re.search(r'(?:pre-?requisite(?:s)?|advised prerequisite(?:s)?)\s*[:\-]?\s*([^.;\n]+)', desc, re.I)
                 p_text = p_match.group(1) if p_match and "nil" not in p_match.group(1).lower() else ""
                 fallback_groups = parse_rule_definition_to_groups("", p_text)
+                prog_restrictions = extract_program_restrictions(desc)
+                subject_area = get_course_subject_area(code)
 
                 catalog[code] = {
                     "code": code,
@@ -267,19 +316,27 @@ def load_full_catalog():
                     "offerings": list(set(offerings)),
                     "career": career,
                     "group": group,
+                    "subject_area": subject_area,
                     "prereq_groups": fallback_groups,
                     "prereq_display": format_prereq_display(fallback_groups),
                     "coreqs": extract_coreqs(desc),
-                    "incompatibles": extract_incompatibles(desc)
+                    "incompatibles": extract_incompatibles(desc),
+                    "program_restrictions": prog_restrictions
                 }
-    except Exception as e:
-        print(f"Catalog fetch error: {e}")
+
+            total_matching = data.get("response", {}).get("resultPacket", {}).get("resultsSummary", {}).get("totalMatching", 0)
+            start_rank += len(results)
+            if start_rank > total_matching:
+                break
+        except Exception as e:
+            print(f"Catalog fetch error at rank {start_rank}: {e}")
+            break
+
     return catalog
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalog_offerings: list):
     subscription_key = "b8ae10d400ef42f89a127abe4a760e46"
-    
     offs_lower = [str(o).lower() for o in catalog_offerings]
     if any("trimester 1" in o or "t1" in o for o in offs_lower):
         primary_term = "3261"
@@ -318,7 +375,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                             rtype = str(r.get("type", "")).upper()
                             rule_def = str(r.get("ruleDefinition", ""))
                             rule_sum = str(r.get("ruleSummary", ""))
-                            
+
                             if "PRE" in rtype:
                                 groups = parse_rule_definition_to_groups(rule_def, rule_sum)
                                 clean_groups = []
@@ -333,7 +390,6 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                             elif "ANTI" in rtype or "INCOMPATIBLE" in rtype:
                                 incompatibles.extend([c for c in extract_course_codes(f"{rule_def} {rule_sum}") if c != clean_code])
 
-                    # Check other requisites specifically for Incompatible / Anti-requisite notations
                     other_req = mapped.get("crseOthrRequiste", {}).get("value") or ""
                     desc_text = mapped.get("crseDescr", {}).get("value", "")
                     combined_req_text = f"{other_req} {desc_text}"
@@ -342,19 +398,13 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     if incomp_match:
                         incompatibles.extend([c for c in extract_course_codes(incomp_match.group(1)) if c != clean_code])
 
+                    prog_restrictions = extract_program_restrictions(combined_req_text)
+
                     final_offerings = list(catalog_offerings)
                     if not final_offerings:
                         tri_val = mapped.get("crseTri", {}).get("value", [])
                         if isinstance(tri_val, list): final_offerings.extend(tri_val)
                         elif isinstance(tri_val, str): final_offerings.append(tri_val)
-
-                        ofrg_tbl = mapped.get("crseOfrg2CrseOfrg", {}).get("value", {})
-                        if isinstance(ofrg_tbl, dict):
-                            for row in ofrg_tbl.get("rows", []):
-                                is_y = row.get("crseOfrg2Ofrd", {}).get("key") == "Y" or row.get("crseOfrg2Ofrd", {}).get("value") == "YES"
-                                p_str = row.get("crseOfrg2TchngPeriod", {}).get("value")
-                                if is_y and p_str and p_str not in final_offerings:
-                                    final_offerings.append(p_str)
 
                     title = data.get("name") or mapped.get("crseShrtDescr", {}).get("value") or clean_code
                     cp_val = mapped.get("crseAwrdCrdtPnts", {}).get("value", {})
@@ -368,10 +418,12 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                         "offerings": list(dict.fromkeys(final_offerings)),
                         "career": data.get("subtype", "Undergraduate"),
                         "group": data.get("orgParent", "Other"),
+                        "subject_area": get_course_subject_area(clean_code),
                         "prereq_groups": prereq_groups,
                         "prereq_display": format_prereq_display(prereq_groups),
                         "coreqs": list(dict.fromkeys(coreqs)),
-                        "incompatibles": list(dict.fromkeys(incompatibles))
+                        "incompatibles": list(dict.fromkeys(incompatibles)),
+                        "program_restrictions": prog_restrictions
                     }
             except Exception:
                 continue
@@ -443,7 +495,6 @@ def parse_degree_results(results):
         career = meta.get("academicCareer", ["Undergraduate"])[0]
         group = meta.get("academicGroupDescription", ["Other"])[0]
 
-        # Normalized campuses (Nathan == Brisbane South, South Bank == Brisbane City)
         clean_campuses = []
         for c in campuses:
             norm = normalize_campus_name(c)
@@ -461,7 +512,6 @@ def parse_degree_results(results):
                 years = int(match.group(1))
                 break
 
-        # CP computation
         cp_val = 240
         for cp in meta.get("creditPoints", []):
             if str(cp).isdigit():
@@ -582,11 +632,7 @@ def fetch_degree_program_rules(degree_code: str):
     return None
 
 def optimize_prescribed_plan(plan: dict, catalog_dict: dict) -> dict:
-    """
-    Smart-adjusts the auto-populated plan by swapping courses across terms
-    if a course is placed in an off-term (e.g. swapping 2525LHS and 2022MSC),
-    ensuring all offering terms and prerequisites are satisfied.
-    """
+    """Smart-adjusts the auto-populated plan to satisfy term offerings and prerequisites."""
     for clist in plan.values():
         for code in clist:
             if code not in catalog_dict:
@@ -612,7 +658,6 @@ def optimize_prescribed_plan(plan: dict, catalog_dict: dict) -> dict:
             for t2 in terms[i+1:]:
                 for c1 in list(plan[t1]):
                     for c2 in list(plan[t2]):
-                        # Test tentative swap
                         plan[t1].remove(c1)
                         plan[t2].remove(c2)
                         plan[t1].append(c2)
@@ -620,12 +665,10 @@ def optimize_prescribed_plan(plan: dict, catalog_dict: dict) -> dict:
 
                         new_score = evaluate_conflicts(plan)
                         if new_score < current_score:
-                            # Swap resolves conflicts without breaking prerequisites
                             current_score = new_score
                             changed = True
                             break
                         else:
-                            # Revert swap
                             plan[t1].remove(c2)
                             plan[t2].remove(c1)
                             plan[t1].append(c1)
@@ -638,13 +681,6 @@ def optimize_prescribed_plan(plan: dict, catalog_dict: dict) -> dict:
     return plan
 
 def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimester 1", campus_preference=None, study_mode="Full-time", fallback_duration=3):
-    """
-    Parses program rules JSON to:
-    1. Extract core courses and detect OR options.
-    2. Extract prescribed study plan (semester by semester).
-    3. Auto-populate courses directly into the progression matrix.
-    4. Accurately assign target CP per term and active terms per year.
-    """
     core_courses = []
     prescribed_matrix_plan = {}
     holding_alternatives = []
@@ -700,7 +736,6 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
                         first_fallback_plan = prog_plan
                     plan_name = sub.get("curriculumReference", {}).get("name", "")
                     clean_plan_name = normalize_campus_name(plan_name)
-                    # Check matching campus preference accurately
                     if clean_camp_pref and (clean_camp_pref.lower() in clean_plan_name.lower() or clean_plan_name.lower() in clean_camp_pref.lower()):
                         chosen_plan = prog_plan
                         break
@@ -720,14 +755,12 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
                 has_flexible_module = True
         target_study_plan_comp = chosen_plan.get("progRuleStdyPlan", {})
 
-    # Extract Flexible Module recommended electives
     for entry in target_flex_data:
         for x in entry.get("listOr", []):
             f_code = str(x.get("code", "")).replace(" ", "").upper()
             if f_code and f_code not in flexible_module_courses:
                 flexible_module_courses.append(f_code)
 
-    # Extract all core courses and OR relationships
     seen_codes = set()
     for entry in target_core_data:
         list_or = entry.get("listOr", [])
@@ -754,7 +787,6 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
                 "or_group": or_partners
             })
 
-    # Study plan parsing
     sp_items = target_study_plan_comp.get("studyPlanItems", [])
     matched_sp = None
     for sp in sp_items:
@@ -800,10 +832,8 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
                                 course_or_map[primary_code] = [c for c in row_codes if c != primary_code]
 
                     prescribed_matrix_plan[(yr_idx, term_num)] = term_slot_courses
-                    # Standard degrees strictly default to 40 CP per term (Full-time)
                     target_cp_map[(yr_idx, term_num)] = 40
 
-    # Specific override for BMedSci (1280) accelerated load
     if is_bmedsci and study_mode == "Full-time":
         duration_years = 2
         include_t3 = True
@@ -813,7 +843,7 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
         }
         active_terms_per_year = {
             1: [1, 2, 3],
-            2: [1, 2]  # No Trimester 3 for Year 2!
+            2: [1, 2]
         }
 
     for c in core_courses:
@@ -831,7 +861,6 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
             if y not in active_terms_per_year:
                 active_terms_per_year[y] = [1, 2, 3] if include_t3 else [1, 2]
 
-    # Smart swap pass: resolves offering mismatches
     prescribed_matrix_plan = optimize_prescribed_plan(prescribed_matrix_plan, catalog)
 
     return core_courses, prescribed_matrix_plan, holding_alternatives, course_or_map, flexible_module_courses, has_flexible_module, {
@@ -843,13 +872,12 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
     }
 
 # -----------------------------------------------------------------------------
-# 7. PLAN VALIDATION ENGINE (AND / OR AWARE)
+# 7. PLAN VALIDATION ENGINE & WHOLE-DEGREE PREREQUISITE EVALUATOR
 # -----------------------------------------------------------------------------
 def term_index(year: int, trimester: int) -> int:
     return (year - 1) * 3 + trimester
 
 def term_from_index(index: int) -> tuple[int, int]:
-    """Converts a flat term index back to (year, trimester). e.g. 3 -> (1, 3), 4 -> (2, 1)."""
     yr = (index - 1) // 3 + 1
     tr = (index - 1) % 3 + 1
     return yr, tr
@@ -875,11 +903,9 @@ def validate_plan(plan: dict, catalog_dict: dict):
             coreqs = info.get("coreqs", [])
             incomps = info.get("incompatibles", [])
 
-            # 1. Offering Check
             if not is_course_offered_in_term(info, tr):
                 c_warns.append(f"Not usually offered in Trimester {tr}")
 
-            # 2. Prerequisite Check with AND / OR Evaluation
             for group in prereq_groups:
                 g_courses = group.get("courses", [])
                 count_needed = group.get("count", 1)
@@ -910,7 +936,6 @@ def validate_plan(plan: dict, catalog_dict: dict):
                     else:
                         c_warns.append(f"Missing Prerequisite: Complete at least {count_needed} of ({' OR '.join(g_courses)})")
 
-            # 3. Corequisite Check
             for cr in coreqs:
                 if cr not in placed_coords:
                     c_warns.append(f"Missing Corequisite: {cr}")
@@ -921,7 +946,6 @@ def validate_plan(plan: dict, catalog_dict: dict):
                     else:
                         c_warns.append(f"Coreq {cr} scheduled after Y{yr} T{tr}")
 
-            # 4. Incompatibility Check
             for inc in incomps:
                 if inc in all_planned and inc != c:
                     c_warns.append(f"Incompatible with {inc}")
@@ -932,6 +956,62 @@ def validate_plan(plan: dict, catalog_dict: dict):
                 satisfied[c] = c_sats
 
     return warnings, satisfied
+
+def evaluate_elective_prereqs(c_info: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
+    """
+    Checks if a candidate course can be taken SOME TIME in the program:
+    1. Checks program restrictions (e.g. 'must be undertaking 1651').
+    2. Checks incompatibility with scheduled courses.
+    3. Checks if all prerequisite groups are satisfied by courses scheduled in the degree.
+    """
+    code = c_info.get("code")
+
+    # 1. Degree / Program Restriction
+    prog_restr = c_info.get("program_restrictions", [])
+    if prog_restr and selected_degree_code:
+        if selected_degree_code not in prog_restr:
+            return False, None, f"Restricted to program(s): {', '.join(prog_restr)}", []
+
+    # 2. Incompatibles
+    incomps = c_info.get("incompatibles", [])
+    for inc in incomps:
+        if inc in planned_coords:
+            pyr, ptr = planned_coords[inc]
+            return False, None, f"Incompatible with {inc} (in plan Y{pyr} T{ptr})", []
+
+    # 3. Prerequisites
+    p_groups = c_info.get("prereq_groups", [])
+    if not p_groups:
+        return True, (1, 1), "No prerequisites — Ready for Year 1 Trimester 1", []
+
+    latest_term = 0
+    missing_groups = []
+    sat_details = []
+
+    for g in p_groups:
+        needed = g.get("count", 1)
+        g_courses = g.get("courses", [])
+        sat_in_g = []
+
+        for p in g_courses:
+            if p in planned_coords:
+                pyr, ptr = planned_coords[p]
+                sat_in_g.append((p, pyr, ptr))
+
+        if len(sat_in_g) < needed:
+            missing_groups.append(g)
+        else:
+            for sc in sat_in_g[:needed]:
+                latest_term = max(latest_term, term_index(sc[1], sc[2]))
+                sat_details.append(f"{sc[0]} (Y{sc[1]} T{sc[2]})")
+
+    if missing_groups:
+        missing_str = format_prereq_display(missing_groups)
+        return False, None, f"Prerequisites needed: {missing_str}", missing_groups
+
+    ready_yr, ready_tr = term_from_index(latest_term + 1)
+    sat_summary = ", ".join(sat_details)
+    return True, (ready_yr, ready_tr), f"Prerequisites met via {sat_summary} — Eligible from Year {ready_yr} Trimester {ready_tr}", []
 
 plan_warnings, plan_satisfied = validate_plan(st.session_state.plan, catalog)
 
@@ -1010,9 +1090,6 @@ if bridge_input:
 # 9. SIDEBAR: DEGREE SELECTION, COURSE SEARCH & STRUCTURE
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    # -------------------------------------------------------------------------
-    # 0. DEGREE PROGRAM SELECTION (EXPANDER)
-    # -------------------------------------------------------------------------
     if st.session_state.selected_degree is None or st.session_state.degree_edit_mode:
         with st.expander("🎓 Select a Degree Program", expanded=True):
             st.write("Search your degree to auto-load its structure and prescribed study plan:")
@@ -1032,16 +1109,13 @@ with st.sidebar:
                 )
                 chosen_degree = next((d for d in matched_degs if d['code'] == chosen_code), matched_degs[0])
 
-                # Intakes / Commencing Dropdown
                 available_intakes = chosen_degree.get("intakes") or ["Trimester 1", "Trimester 2"]
                 order_map = {"trimester 1": 1, "t1": 1, "trimester 2": 2, "t2": 2, "trimester 3": 3, "t3": 3}
                 sorted_intakes = sorted(available_intakes, key=lambda x: order_map.get(str(x).lower().strip(), 99))
                 intake_choice = st.selectbox("Starting Trimester", options=sorted_intakes, key="deg_start_intake")
 
-                # Study Load
                 mode_choice = st.selectbox("Study Load", options=["Full-time", "Part-time"], key="deg_study_mode")
 
-                # Campus Option (Unified: Nathan == Brisbane South, South Bank == Brisbane City)
                 campuses = chosen_degree.get("campuses") or []
                 campus_choice = None
                 if len(campuses) > 1:
@@ -1069,7 +1143,6 @@ with st.sidebar:
                             st.session_state.degree_campus = campus_choice
                             st.session_state.degree_edit_mode = False
 
-                            # Auto-configure structure
                             st.session_state.num_years_slider = min(10, max(1, plan_meta["duration_years"]))
                             st.session_state.include_t3_cb = plan_meta["include_t3"]
                             st.session_state.term_target_cp = plan_meta["target_cp_map"]
@@ -1080,11 +1153,9 @@ with st.sidebar:
                             st.session_state.degree_flex_courses = flex_courses
                             st.session_state.has_flexible_module = has_flex
 
-                            # AUTO-POPULATE PRESCRIBED COURSES DIRECTLY INTO MATRIX
                             st.session_state.plan = prescribed_plan
                             st.session_state.holding_zone = holding_alts
 
-                            # Pre-lookup all courses
                             all_needed_codes = [c for c_list in prescribed_plan.values() for c in c_list] + holding_alts
                             for c_code in all_needed_codes:
                                 if c_code not in catalog:
@@ -1133,24 +1204,12 @@ with st.sidebar:
 
     st.divider()
 
-    # -------------------------------------------------------------------------
     # 1. ADD A COURSE
-    # -------------------------------------------------------------------------
     st.header("1. Add a Course")
-
     current_yr = datetime.now().year
     with st.form("course_search_form", clear_on_submit=True):
-        course_code_input = st.text_input(
-            "Course Code",
-            placeholder="eg. 1001MSC",
-            key="input_course_code"
-        )
-        planned_year = st.selectbox(
-            "Which year are you planning to do the course?",
-            options=list(range(current_yr, 2031)),
-            index=0,
-            key="planned_course_year"
-        )
+        course_code_input = st.text_input("Course Code", placeholder="eg. 1001MSC", key="input_course_code")
+        planned_year = st.selectbox("Planned Year", options=list(range(current_yr, 2031)), index=0, key="planned_course_year")
         submit_btn = st.form_submit_button("Add Course", type="primary")
 
     if submit_btn:
@@ -1186,9 +1245,7 @@ with st.sidebar:
 
     st.divider()
 
-    # -------------------------------------------------------------------------
     # 2. DEGREE STRUCTURE & CORE SCHEDULE
-    # -------------------------------------------------------------------------
     st.header("2. Degree Structure")
     num_years = st.slider("Degree Duration (Years)", min_value=1, max_value=10, key="num_years_slider")
     include_t3 = st.checkbox("Include Trimester 3 (Summer)", key="include_t3_cb")
@@ -1200,11 +1257,10 @@ with st.sidebar:
         for clist in st.session_state.plan.values() for c in clist
     )
     total_deg_cp = st.session_state.get("total_degree_cp", num_years * 80)
-    
+
     st.metric("Total Courses Planned", f"{total_planned}")
     st.metric("Total Credit Points", f"{total_cp} / {total_deg_cp} CP")
 
-    # List of all Core Courses and their offerings
     core_list = st.session_state.get("degree_core_courses", [])
     if core_list:
         with st.expander("📚 Core Courses & Offerings", expanded=False):
@@ -1215,17 +1271,16 @@ with st.sidebar:
                 st.markdown(f"**{c_code}** — {info.get('title', c_obj.get('name', ''))} (`{offs}`)")
 
     st.divider()
-    
-    # Bulk Plan Management Controls
+
     with st.expander("⚡ Bulk Plan Controls", expanded=False):
         c_clear_all, c_hold_all = st.columns(2)
         with c_clear_all:
-            if st.button("🗑️ Delete All", use_container_width=True, help="Clear all courses from the progression matrix"):
+            if st.button("🗑️ Delete All", use_container_width=True):
                 st.session_state.plan = {}
                 st.session_state.selected_course = None
                 st.rerun()
         with c_hold_all:
-            if st.button("📥 Hold All", use_container_width=True, help="Move all planned courses back to holding zone"):
+            if st.button("📥 Hold All", use_container_width=True):
                 for clist in st.session_state.plan.values():
                     for c in clist:
                         if c not in st.session_state.holding_zone:
@@ -1269,7 +1324,6 @@ with st.sidebar:
 # 10. HTML, CSS & JS COMPONENT BUILDER
 # -----------------------------------------------------------------------------
 def string_to_pastel_hex(code_string: str) -> str:
-    """Generates a deterministic pastel hex color from the course code."""
     clean_code = str(code_string).strip().upper()
     hash_digest = hashlib.md5(clean_code.encode()).hexdigest()
     hash_int = int(hash_digest[:8], 16)
@@ -1305,9 +1359,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         overflow-x: hidden !important;
     }
 
-    * {
-        box-sizing: border-box;
-    }
+    * { box-sizing: border-box; }
 
     .planner-box {
         background: var(--bg-color);
@@ -1330,7 +1382,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         margin-bottom: 12px;
     }
 
-    /* Course Cards */
     .course-card {
         position: relative;
         border-radius: 6px;
@@ -1440,7 +1491,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
     .warning-pill {
         background-color: #d63031 !important;
         color: #ffffff !important;
-        border: none !important;
         font-size: 10px !important;
         padding: 4px 8px !important;
         border-radius: 4px !important;
@@ -1453,7 +1503,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
     .success-pill {
         background-color: #00b894 !important;
         color: #ffffff !important;
-        border: none !important;
         font-size: 10px !important;
         padding: 4px 8px !important;
         border-radius: 4px !important;
@@ -1468,19 +1517,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         box-shadow: 0 0 14px rgba(255, 71, 87, 0.9) !important;
     }
 
-    .course-card.has-prereq-error.is-selected {
-        border: 2px solid #ff4757 !important;
-        box-shadow: 0 0 18px rgba(255, 71, 87, 1) !important;
-        animation: pulse-red 1.6s infinite !important;
-    }
-
-    @keyframes pulse-red {
-        0% { box-shadow: 0 0 6px rgba(255, 71, 87, 0.5); }
-        50% { box-shadow: 0 0 20px rgba(255, 71, 87, 1); }
-        100% { box-shadow: 0 0 6px rgba(255, 71, 87, 0.5); }
-    }
-
-    /* Scrollable, Responsive Holding Grid */
     .holding-grid {
         display: grid;
         grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
@@ -1493,21 +1529,10 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         border-radius: 8px;
     }
 
-    .holding-grid::-webkit-scrollbar {
-        width: 7px;
-    }
-    .holding-grid::-webkit-scrollbar-track {
-        background: rgba(0, 0, 0, 0.2);
-        border-radius: 4px;
-    }
-    .holding-grid::-webkit-scrollbar-thumb {
-        background: rgba(255, 255, 255, 0.25);
-        border-radius: 4px;
-    }
-    .holding-grid::-webkit-scrollbar-thumb:hover {
-        background: rgba(255, 255, 255, 0.4);
-    }
-    
+    .holding-grid::-webkit-scrollbar { width: 7px; }
+    .holding-grid::-webkit-scrollbar-track { background: rgba(0, 0, 0, 0.2); border-radius: 4px; }
+    .holding-grid::-webkit-scrollbar-thumb { background: rgba(255, 255, 255, 0.25); border-radius: 4px; }
+
     .year-container {
         margin-top: 14px;
         border: 1px solid var(--border-color);
@@ -1536,9 +1561,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         box-sizing: border-box;
     }
 
-    .trim-col:last-child {
-        border-right: none;
-    }
+    .trim-col:last-child { border-right: none; }
 
     .trim-header {
         font-size: 11.5px;
@@ -1687,7 +1710,6 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                     badges_html += f"<div class='success-pill' title='{'; '.join(sats)}'>✅ {sats[0]}</div>"
 
                 offs = format_offerings_label(c_data.get("offerings", []))
-
                 is_core = c in core_set
                 core_badge = '<span class="core-tag">CORE</span>' if is_core else ''
 
@@ -1772,21 +1794,16 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         }, 50);
     }
 
-    function onCourseClick(code) {
-        triggerBridgeAction("SELECT___TOKEN___" + code);
-    }
-
+    function onCourseClick(code) { triggerBridgeAction("SELECT___TOKEN___" + code); }
     function onSlotClick(year, term) {
         const selCode = \"""" + (selected_code or "") + """\";
         if (!selCode) return;
         triggerBridgeAction("PLACE___TOKEN___" + selCode + "___" + year + "___" + term);
     }
-
     function onRemoveHolding(e, code) {
         e.stopPropagation();
         triggerBridgeAction("REMOVE_HOLDING___TOKEN___" + code);
     }
-
     function onMoveToHolding(e, code, year, term) {
         e.stopPropagation();
         triggerBridgeAction("MOVE_TO_HOLDING___TOKEN___" + code + "___" + year + "___" + term);
@@ -1809,7 +1826,7 @@ st.caption("Plan your study terms, check prerequisites, and schedule your degree
 
 st.session_state['plan_satisfied_dict'] = plan_satisfied
 
-# Course Requisites Expander (Collapsed by default)
+# Course Requisites Expander
 if plan_warnings or plan_satisfied:
     with st.expander(f"📋 Course Requisites & Status ({len(plan_warnings)} warnings, {len(plan_satisfied)} satisfied)", expanded=False):
         if plan_warnings:
@@ -1825,75 +1842,141 @@ if plan_warnings or plan_satisfied:
 elif st.session_state.plan:
     st.success("✅ All scheduled courses satisfy prerequisite, corequisite, and offering constraints.")
 
-# --- ELECTIVE / FLEXIBLE MODULE SUGGESTIONS PANEL ---
-if st.session_state.get("selected_degree") and st.session_state.get("has_flexible_module", False):
-    with st.expander("💡 Elective & Flexible Module Suggestions", expanded=False):
-        st.write("Browse recommended electives and courses across Griffith. Filter by discipline, level, or keyword:")
+# -----------------------------------------------------------------------------
+# 12. ADVANCED ELECTIVE & UNIVERSAL COURSE EXPLORER
+# -----------------------------------------------------------------------------
+if st.session_state.get("selected_degree"):
+    with st.expander("💡 Elective & University Course Explorer (Full ~3,000 Catalog)", expanded=False):
+        st.write("Browse and filter across the complete Griffith course catalog. Automatically checks if you satisfy prerequisites based on your scheduled degree progression:")
 
-        # Pagination & Filter Session State Setup
         if "sug_page" not in st.session_state:
             st.session_state.sug_page = 1
 
         core_set = {c["code"] for c in st.session_state.get("degree_core_courses", [])}
-        planned_set = {c for clist in st.session_state.plan.values() for c in clist} | set(st.session_state.holding_zone)
+        planned_coords = {c: (yr, tr) for (yr, tr), clist in st.session_state.plan.items() for c in clist}
+        planned_or_held = set(planned_coords.keys()) | set(st.session_state.holding_zone)
+        sel_deg_code = st.session_state.selected_degree.get("code")
 
         candidates = []
         seen_cand = set()
 
-        # 1. Recommended flexible courses from degree rules
+        # 1. Degree Recommended Flexible Courses
         for f_code in st.session_state.get("degree_flex_courses", []):
-            if f_code not in core_set and f_code not in planned_set and f_code not in seen_cand:
+            if f_code not in core_set and f_code not in planned_or_held and f_code not in seen_cand:
                 info = catalog.get(f_code) or lookup_course(f_code) or {}
                 if info and info.get("code"):
                     info["is_degree_recommended"] = True
                     candidates.append(info)
                     seen_cand.add(f_code)
 
-        # 2. Universal catalog: Search all undergraduate courses across Griffith
+        # 2. Universal Course Catalog across all faculties
         for c_code, c_info in catalog.items():
-            if c_code not in core_set and c_code not in planned_set and c_code not in seen_cand:
+            if c_code not in core_set and c_code not in planned_or_held and c_code not in seen_cand:
                 career = str(c_info.get("career", "")).lower()
+                # Undergraduate awards prioritize UG electives
                 if "postgrad" not in career and "research" not in career:
                     c_info["is_degree_recommended"] = False
                     candidates.append(c_info)
                     seen_cand.add(c_code)
 
-        # Search & Filter Controls Bar
-        col_f1, col_f2, col_f3, col_f4 = st.columns([2.2, 1.4, 2, 1])
-        with col_f1:
-            all_groups = sorted(list(set(c.get("group", "Other") for c in candidates if c.get("group"))))
-            sel_group = st.selectbox("Discipline / Academic Group", options=["All"] + all_groups, key="sug_filter_grp")
-        with col_f2:
-            sel_level = st.selectbox("Course Level", options=["All", "Level 1 (1xxx)", "Level 2 (2xxx)", "Level 3 (3xxx)", "Level 4 (4xxx)"], key="sug_filter_lvl")
-        with col_f3:
-            sug_keyword = st.text_input("Search Keyword / Code", placeholder="e.g. data, ethics, 2020...", key="sug_filter_kw")
-        with col_f4:
-            per_page = st.selectbox("Per Page", options=[10, 25, 50], index=0, key="sug_per_page")
+        # Evaluate Whole-Degree Prerequisite Satisfaction
+        candidate_evaluations = []
+        for c in candidates:
+            is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(c, planned_coords, sel_deg_code)
+            lvl_lbl = get_course_level_label(c["code"])
+            subj_area = c.get("subject_area") or get_course_subject_area(c["code"])
+            rank_score = term_index(early_term[0], early_term[1]) if early_term else 9999
 
-        # Level helper
-        def get_level_digit(code_str):
-            m = re.search(r'\d', code_str)
-            return m.group(0) if m else "1"
+            candidate_evaluations.append({
+                "course": c,
+                "is_eligible": is_elig,
+                "earliest_term": early_term,
+                "earliest_term_rank": rank_score,
+                "explanation": expl_msg,
+                "missing": missing,
+                "level": lvl_lbl,
+                "subject_area": subj_area
+            })
+
+        # --- MULTISELECT CONTROLS & FILTER BAR ---
+        col_f1, col_f2, col_f3 = st.columns([1.8, 1.3, 1.4])
+        with col_f1:
+            all_groups = sorted(list({c.get("group", "Other") for c in candidates if c.get("group")}))
+            sel_groups = st.multiselect(
+                "Discipline / Academic Group",
+                options=all_groups,
+                placeholder="All disciplines (or select multiple...)",
+                key="sug_filter_grps"
+            )
+        with col_f2:
+            level_options = ["Level 1 (1xxx)", "Level 2 (2xxx)", "Level 3 (3xxx)", "Level 4 (4xxx)", "Level 5+ (5xxx+)"]
+            sel_levels = st.multiselect(
+                "Course Level",
+                options=level_options,
+                placeholder="All levels (or select multiple...)",
+                key="sug_filter_lvls"
+            )
+        with col_f3:
+            all_areas = sorted(list({ce["subject_area"] for ce in candidate_evaluations if ce["subject_area"]}))
+            sel_areas = st.multiselect(
+                "Area of Study (Subject Code)",
+                options=all_areas,
+                placeholder="e.g. MSC, ESC, NSC, ENG...",
+                key="sug_filter_areas"
+            )
+
+        col_search, col_tgl, col_pp = st.columns([2.2, 1.8, 0.8])
+        with col_search:
+            sug_keyword = st.text_input("Search Keyword or Code", placeholder="e.g. data, biostatistics, 2022...", key="sug_filter_kw")
+        with col_tgl:
+            only_prereqs_met = st.checkbox(
+                "Only show courses where prerequisites are satisfied in your program",
+                value=True,
+                key="sug_filter_prereq_met",
+                help="Filters to courses with no prerequisites or where all prerequisites are satisfied by courses scheduled in your degree matrix."
+            )
+        with col_pp:
+            per_page = st.selectbox("Per Page", options=[10, 25, 50], index=0, key="sug_per_page")
 
         # Apply Filters
         filtered_sug = []
         kw = sug_keyword.strip().lower()
-        for c in candidates:
+
+        for item in candidate_evaluations:
+            c = item["course"]
             code = c["code"]
-            if sel_group != "All" and c.get("group") != sel_group:
+            grp = c.get("group", "Other")
+            lvl = item["level"]
+            area = item["subject_area"]
+            is_eligible = item["is_eligible"]
+
+            if only_prereqs_met and not is_eligible:
                 continue
-            if sel_level != "All":
-                target_lvl = sel_level.split(" ")[1][0]
-                if get_level_digit(code) != target_lvl:
+            if sel_groups and grp not in sel_groups:
+                continue
+            if sel_levels and lvl not in sel_levels:
+                continue
+            if sel_areas and area not in sel_areas:
+                continue
+            if kw:
+                searchable = f"{code} {c.get('title', '')} {c.get('description', '')}".lower()
+                if kw not in searchable:
                     continue
-            if kw and (kw not in code.lower() and kw not in c.get("title", "").lower()):
-                continue
-            filtered_sug.append(c)
+
+            filtered_sug.append(item)
+
+        # Sort: Recommended electives first, then eligible courses, then by earliest availability
+        filtered_sug.sort(key=lambda x: (
+            not x["course"].get("is_degree_recommended", False),
+            not x["is_eligible"],
+            x["earliest_term_rank"],
+            x["course"]["code"]
+        ))
 
         total_results = len(filtered_sug)
 
         if total_results == 0:
-            st.caption("No elective suggestions match the selected filters.")
+            st.info("No courses match your active filter criteria and prerequisite settings.")
         else:
             total_pages = max(1, (total_results + per_page - 1) // per_page)
             st.session_state.sug_page = min(max(1, st.session_state.sug_page), total_pages)
@@ -1903,10 +1986,9 @@ if st.session_state.get("selected_degree") and st.session_state.get("has_flexibl
             end_idx = min(start_idx + per_page, total_results)
             page_items = filtered_sug[start_idx:end_idx]
 
-            # Header & Counter Bar
             col_count, col_nav = st.columns([3, 2])
             with col_count:
-                st.markdown(f"**Showing {start_idx + 1}–{end_idx} of {total_results:,} matching courses**")
+                st.markdown(f"**Showing {start_idx + 1}–{end_idx} of {total_results:,} available courses**")
             with col_nav:
                 c_prev, c_txt, c_next = st.columns([1, 1.8, 1])
                 with c_prev:
@@ -1920,63 +2002,91 @@ if st.session_state.get("selected_degree") and st.session_state.get("has_flexibl
                         st.session_state.sug_page += 1
                         st.rerun()
 
-            st.write("")
-            placed_coords = {c: (yr, tr) for (yr, tr), clist in st.session_state.plan.items() for c in clist}
+            # --- CSS INJECTION FOR MODERN COURSE ROWS ---
+            st.markdown(
+                """
+                <style>
+                .sug-card {
+                    background: rgba(255, 255, 255, 0.02);
+                    border: 1px solid rgba(255, 255, 255, 0.1);
+                    border-radius: 8px;
+                    padding: 12px 16px;
+                    margin-bottom: 9px;
+                    transition: border-color 0.2s ease, background 0.2s ease;
+                }
+                .sug-card:hover {
+                    border-color: rgba(112, 161, 255, 0.6);
+                    background: rgba(255, 255, 255, 0.05);
+                }
+                .tag-pill {
+                    display: inline-block;
+                    padding: 2px 7px;
+                    border-radius: 4px;
+                    font-size: 10px;
+                    font-weight: 700;
+                    margin-right: 5px;
+                }
+                .tag-area { background: rgba(112, 161, 255, 0.18); color: #70a1ff; border: 1px solid rgba(112, 161, 255, 0.35); }
+                .tag-level { background: rgba(165, 94, 234, 0.18); color: #a55eea; border: 1px solid rgba(165, 94, 234, 0.35); }
+                .tag-off { background: rgba(255, 165, 2, 0.18); color: #ffa502; border: 1px solid rgba(255, 165, 2, 0.35); }
+                .tag-cp { background: rgba(255, 255, 255, 0.1); color: #f1f2f6; }
+                .tag-rec { background: rgba(255, 215, 0, 0.2); color: #ffd700; border: 1px solid #ffd700; }
+                .status-ready { color: #2ed573; font-weight: 600; font-size: 11px; }
+                .status-pending { color: #ff9f1a; font-weight: 600; font-size: 11px; }
+                </style>
+                """,
+                unsafe_allow_html=True
+            )
 
-            # Modern Table Rows
-            for c_info in page_items:
+            for item in page_items:
+                c_info = item["course"]
                 c_code = c_info["code"]
                 title = c_info["title"]
                 cp = c_info.get("credit_points", "10")
                 offs = format_offerings_label(c_info.get("offerings", []))
-                p_groups = c_info.get("prereq_groups", [])
+                area_tag = item["subject_area"]
+                lvl_tag = item["level"].split(" ")[0] + " " + item["level"].split(" ")[1]
+                is_rec = c_info.get("is_degree_recommended", False)
+                expl = item["explanation"]
 
-                # Check Incompatibles
-                incomps = c_info.get("incompatibles", [])
-                has_incomp = any(inc in placed_coords for inc in incomps)
+                status_class = "status-ready" if item["is_eligible"] else "status-pending"
+                rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if is_rec else ''
 
-                # Determine Readiness
-                prereq_status_str = "✅ Ready for Y1 T1 (No prereqs)"
-                if has_incomp:
-                    clashing_inc = next(inc for inc in incomps if inc in placed_coords)
-                    prereq_status_str = f"🚫 Incompatible with {clashing_inc} in your plan"
-                elif p_groups:
-                    latest_term = 0
-                    all_sat = True
-                    for g in p_groups:
-                        needed = g.get("count", 1)
-                        sat_in_g = 0
-                        for p in g.get("courses", []):
-                            if p in placed_coords:
-                                sat_in_g += 1
-                                pyr, ptr = placed_coords[p]
-                                latest_term = max(latest_term, term_index(pyr, ptr))
-                        if sat_in_g < needed:
-                            all_sat = False
-                            break
-
-                    if all_sat:
-                        if latest_term == 0:
-                            prereq_status_str = "✅ Prereqs satisfied! Ready for Y1 T1"
-                        else:
-                            ready_yr, ready_tr = term_from_index(latest_term + 1)
-                            prereq_status_str = f"✅ Prereqs satisfied! Ready from Y{ready_yr} T{ready_tr}"
-                    else:
-                        prereq_status_str = f"⏳ Prereqs needed: {format_prereq_display(p_groups)}"
-
-                rec_badge = " ⭐ Recommended Elective" if c_info.get("is_degree_recommended") else ""
-
-                with st.container(border=True):
-                    c_main, c_btn = st.columns([5.2, 0.8])
+                with st.container():
+                    c_main, c_btn = st.columns([5.3, 0.7])
                     with c_main:
-                        st.markdown(f"**{c_code}** — {title} &nbsp;<span style='color:#e67e22; font-size:11px; font-weight:700;'>{rec_badge}</span>", unsafe_allow_html=True)
-                        st.caption(f"**{cp} CP** • Offering: `{offs}` • Group: *{c_info.get('group', 'General')}* • {prereq_status_str}")
+                        st.markdown(
+                            f"""
+                            <div class="sug-card">
+                                <div style="display:flex; justify-content:space-between; align-items:center;">
+                                    <span style="font-size:13.5px; font-weight:700;">
+                                        {c_code} — {title} {rec_badge}
+                                    </span>
+                                </div>
+                                <div style="margin-top:6px; margin-bottom:4px;">
+                                    <span class="tag-pill tag-area">{area_tag}</span>
+                                    <span class="tag-pill tag-level">{lvl_tag}</span>
+                                    <span class="tag-pill tag-cp">{cp} CP</span>
+                                    <span class="tag-pill tag-off">Offerings: {offs}</span>
+                                    <span class="tag-pill" style="background:rgba(255,255,255,0.06); color:#a4b0be;">{c_info.get('group', 'General')}</span>
+                                </div>
+                                <div class="{status_class}">
+                                    {expl}
+                                </div>
+                            </div>
+                            """,
+                            unsafe_allow_html=True
+                        )
                     with c_btn:
-                        if st.button("➕ Add", key=f"add_sug_{c_code}", use_container_width=True, help="Add to Course Holding Zone"):
+                        st.write("")
+                        if st.button("➕ Add", key=f"add_sug_{c_code}", use_container_width=True, help=f"Add {c_code} to Course Holding Zone"):
                             if c_code not in st.session_state.holding_zone:
                                 st.session_state.holding_zone.append(c_code)
                             st.rerun()
 
+# -----------------------------------------------------------------------------
+# 13. PLANNER HTML RENDER
+# -----------------------------------------------------------------------------
 holding_count = len(st.session_state.holding_zone)
 holding_rendered_height = 80 if holding_count == 0 else min(310, 60 + ((holding_count + 2) // 3) * 115)
 
