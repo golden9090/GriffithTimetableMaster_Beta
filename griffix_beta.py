@@ -112,23 +112,49 @@ def get_course_subject_area(code_str: str) -> str:
     m = re.search(r'[A-Z]{3,4}', clean)
     return m.group(0) if m else "OTHER"
 
+def get_course_level_num(code_str: str) -> int:
+    """Extracts the course level digit (e.g. 1014MSC -> 1, 7001IBA -> 7)."""
+    m = re.search(r'\d', str(code_str))
+    return int(m.group(0)) if m else 0
+
 def get_course_level_label(code_str: str) -> str:
-    """Identifies course level from the first digit (e.g. 1014MSC -> Level 1)."""
-    m = re.search(r'\d', code_str)
-    if not m:
-        return "Other Level"
-    d = int(m.group(0))
-    if d == 1:
+    """Identifies course level label."""
+    lvl = get_course_level_num(code_str)
+    if lvl == 1:
         return "Level 1 (1xxx)"
-    elif d == 2:
+    elif lvl == 2:
         return "Level 2 (2xxx)"
-    elif d == 3:
+    elif lvl == 3:
         return "Level 3 (3xxx)"
-    elif d == 4:
+    elif lvl == 4:
         return "Level 4 (4xxx)"
-    elif d >= 5:
-        return "Level 5+ (5xxx+)"
+    elif lvl == 5:
+        return "Level 5 (5xxx)"
+    elif lvl >= 6:
+        return f"Level {lvl} ({lvl}xxx)"
     return "Other Level"
+
+def format_campuses_label(campuses_list) -> str:
+    """Formats campuses list into concise badge text (e.g. 'Gold Coast', 'Nathan, GC')."""
+    if not campuses_list:
+        return ""
+    clean = []
+    for c in campuses_list:
+        norm = normalize_campus_name(c)
+        if "Nathan" in norm or "Brisbane South" in norm:
+            clean.append("Nathan")
+        elif "South Bank" in norm or "Brisbane City" in norm:
+            clean.append("South Bank")
+        elif "Gold Coast" in norm:
+            clean.append("Gold Coast")
+        elif "Logan" in norm:
+            clean.append("Logan")
+        elif "Online" in norm:
+            clean.append("Online")
+        elif norm:
+            clean.append(norm)
+    dedup = list(dict.fromkeys(clean))
+    return ", ".join(dedup) if dedup else ""
 
 # -----------------------------------------------------------------------------
 # 3. REQUISITES & OFFERINGS PARSER (CP-AWARE & PROGRAM-AWARE)
@@ -419,12 +445,16 @@ def load_full_catalog():
                 continue
             code = str(cat_numbers[0]).replace(" ", "").upper().strip()
             desc = meta.get("description", [""])[0] or ""
+            raw_cmps = meta.get("campusName", []) or meta.get("campus", [])
+            clean_cmps = list(dict.fromkeys([normalize_campus_name(x) for x in raw_cmps if normalize_campus_name(x)]))
+
             catalog[code] = {
                 "code": code,
                 "title": meta.get("title", [code])[0],
                 "credit_points": meta.get("creditPoints", ["10"])[0],
                 "description": desc,
                 "offerings": list(set(meta.get("nextOffering", []))),
+                "campuses": clean_cmps, # <-- Store campuses
                 "career": meta.get("academicCareerName", ["Undergraduate"])[0],
                 "group": meta.get("academicGrpDescription", ["Other"])[0],
                 "subject_area": get_course_subject_area(code),
@@ -513,6 +543,28 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
                     prog_restrictions = extract_program_restrictions(combined_req_text, mapped_components=mapped)
 
+                    # Inside fetch_course_from_curriculum_api after parsing prog_restrictions:
+                    campuses = []
+                    cmps_val = mapped.get("crseCmps", {}).get("value", [])
+                    if isinstance(cmps_val, list):
+                        for c_item in cmps_val:
+                            if isinstance(c_item, dict):
+                                c_name = c_item.get("value") or c_item.get("name")
+                                if c_name: campuses.append(normalize_campus_name(c_name))
+                            elif isinstance(c_item, str):
+                                campuses.append(normalize_campus_name(c_item))
+                    elif isinstance(cmps_val, dict):
+                        c_name = cmps_val.get("value")
+                        if c_name: campuses.append(normalize_campus_name(c_name))
+
+                    ofrg2_rows = mapped.get("crseOfrg2CrseOfrg", {}).get("value", {}).get("rows", [])
+                    for r in ofrg2_rows:
+                        cmps_cell = r.get("crseOfrg2CmpsId", {})
+                        if isinstance(cmps_cell, dict) and cmps_cell.get("value"):
+                            campuses.append(normalize_campus_name(cmps_cell["value"]))
+
+                    campuses = list(dict.fromkeys([c for c in campuses if c]))
+
                     final_offerings = list(catalog_offerings)
                     if not final_offerings:
                         tri_val = mapped.get("crseTri", {}).get("value", [])
@@ -529,6 +581,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                         "credit_points": cp,
                         "description": desc_text,
                         "offerings": list(dict.fromkeys(final_offerings)),
+                        "campuses": campuses, # <-- Stored in curriculum API metadata
                         "career": data.get("subtype", "Undergraduate"),
                         "group": data.get("orgParent", "Other"),
                         "subject_area": get_course_subject_area(clean_code),
@@ -2027,7 +2080,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
 
     # Inside build_planner_html -> Holding Zone Cards loop:
     for code in holding_zone:
-        info = lookup_course(code) or catalog_dict.get(code) or {"title": code, "credit_points": "10", "offerings": [], "prereq_display": "No Prereqs", "group": ""}
+        info = lookup_course(code) or catalog_dict.get(code) or {"title": code, "credit_points": "10", "offerings": [], "campuses": [], "prereq_display": "No Prereqs", "group": ""}
         bg = string_to_pastel_hex(code)
         is_sel = "is-selected" if code == selected_code else ""
 
@@ -2035,6 +2088,10 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         pr_text = f"Pre: {pr_display}"
         cr_text = f" | Co: {', '.join(info['coreqs'])}" if info.get("coreqs") else ""
         offs = format_offerings_label(info.get("offerings", []))
+
+        # Campus badge
+        camp_lbl = format_campuses_label(info.get("campuses", []))
+        camp_badge = f'<span class="badge-pill" style="background: rgba(0, 184, 148, 0.25); border: 1px solid rgba(0, 184, 148, 0.45); color: #55efc4;" title="Campus: {camp_lbl}">📍 {camp_lbl}</span>' if camp_lbl else ''
 
         is_core = code in core_set
         core_badge = '<span class="core-tag">CORE</span>' if is_core else ''
@@ -2054,6 +2111,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
             <div class="badges-row">
                 <span class="badge-pill">{info.get('credit_points', '10')} CP</span>
                 <span class="badge-pill">{offs}</span>
+                {camp_badge}
                 {or_badge}
             </div>
             <div style="font-size: 9.5px; opacity: 0.95; margin-top: 5px; word-break: break-word;">{pr_text}{cr_text}</div>
@@ -2099,13 +2157,13 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
             """
 
             for c in scheduled:
-                c_data = catalog_dict.get(c) or lookup_course(c) or {"title": c, "credit_points": "10", "offerings": [], "prereq_display": "No Prereqs", "group": ""}
+                c_data = lookup_course(c) or catalog_dict.get(c) or {"title": c, "credit_points": "10", "offerings": [], "campuses": [], "prereq_display": "No Prereqs", "group": ""}
                 bg = string_to_pastel_hex(c)
                 is_sel = "is-selected" if c == selected_code else ""
                 warns = warnings_dict.get(c, [])
                 sats = st.session_state.get('plan_satisfied_dict', {}).get(c, [])
 
-                has_prereq_issue = any("prereq" in str(w).lower() for w in warns)
+                has_prereq_issue = any("prereq" in str(w).lower() or "restricted" in str(w).lower() or "incompatible" in str(w).lower() for w in warns)
                 prereq_glow_class = "has-prereq-error" if has_prereq_issue else ""
 
                 badges_html = ""
@@ -2115,6 +2173,11 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                     badges_html += f"<div class='success-pill' title='{'; '.join(sats)}'>✅ {sats[0]}</div>"
 
                 offs = format_offerings_label(c_data.get("offerings", []))
+                
+                # Campus badge in matrix
+                camp_lbl = format_campuses_label(c_data.get("campuses", []))
+                camp_badge_matrix = f'<span class="badge-pill" style="background: rgba(0, 184, 148, 0.25); border: 1px solid rgba(0, 184, 148, 0.45); color: #55efc4;" title="Campus: {camp_lbl}">📍 {camp_lbl}</span>' if camp_lbl else ''
+
                 is_core = c in core_set
                 core_badge = '<span class="core-tag">CORE</span>' if is_core else ''
 
@@ -2133,6 +2196,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                     <div class="badges-row">
                         <span class="badge-pill">{c_data.get('credit_points', '10')} CP</span>
                         <span class="badge-pill">{offs}</span>
+                        {camp_badge_matrix}
                         {or_badge_matrix}
                     </div>
                     {badges_html}
@@ -2267,6 +2331,9 @@ if st.session_state.get("selected_degree"):
         # 1. Degree Recommended Flexible Courses (Placed First)
         for f_code in st.session_state.get("degree_flex_courses", []):
             if f_code not in core_set and f_code not in planned_or_held and f_code not in seen_cand:
+                # Filter out level 6+ (postgrad) courses
+                if get_course_level_num(f_code) >= 6:
+                    continue
                 info = lookup_course(f_code) or catalog.get(f_code) or {}
                 if info and info.get("code"):
                     c_copy = dict(info)
@@ -2274,21 +2341,27 @@ if st.session_state.get("selected_degree"):
                     candidates.append(c_copy)
                     seen_cand.add(f_code)
 
-        # 2. Universal Course Catalog across all faculties
+        # 2. Universal Course Catalog across all faculties (Excluding Level 6+)
         for c_code, c_info in catalog.items():
             if c_code not in core_set and c_code not in planned_or_held and c_code not in seen_cand:
+                # Filter out Level 6, 7, 8, 9 courses
+                if get_course_level_num(c_code) >= 6:
+                    continue
+
                 career = str(c_info.get("career", "")).lower()
-                if "postgrad" not in career and "research" not in career:
-                    c_copy = dict(c_info)
-                    c_copy["is_degree_recommended"] = (c_code in deg_flex_set)
-                    candidates.append(c_copy)
-                    seen_cand.add(c_code)
+                if "postgrad" in career or "research" in career:
+                    continue
+
+                c_copy = dict(c_info)
+                c_copy["is_degree_recommended"] = (c_code in deg_flex_set)
+                candidates.append(c_copy)
+                seen_cand.add(c_code)
 
         # Evaluate Whole-Degree Prerequisite Satisfaction & Compatibility
         candidate_evaluations = []
         for c in candidates:
             code = c["code"]
-            is_compat, compat_msg = is_course_degree_compatible(c, sel_deg_code, planned_coords)
+            is_compat, compat_msg = is_course_degree_compatible(c, sel_deg_code, planned_or_held, catalog)
             is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(c, st.session_state.plan, planned_coords, sel_deg_code)
             lvl_lbl = get_course_level_label(code)
             subj_area = c.get("subject_area") or get_course_subject_area(code)
@@ -2320,7 +2393,8 @@ if st.session_state.get("selected_degree"):
                 key="sug_filter_grps"
             )
         with col_f2:
-            level_options = ["Level 1 (1xxx)", "Level 2 (2xxx)", "Level 3 (3xxx)", "Level 4 (4xxx)", "Level 5+ (5xxx+)"]
+            # Undergraduate level options only (Levels 1 to 5)
+            level_options = ["Level 1 (1xxx)", "Level 2 (2xxx)", "Level 3 (3xxx)", "Level 4 (4xxx)", "Level 5 (5xxx)"]
             sel_levels = st.multiselect(
                 "Course Level",
                 options=level_options,
@@ -2361,6 +2435,10 @@ if st.session_state.get("selected_degree"):
             area = item["subject_area"]
             is_eligible = item["is_eligible"]
             is_compat = item["is_degree_compat"]
+
+            # Filter out Level 6+ courses
+            if get_course_level_num(code) >= 6:
+                continue
 
             # If checked, DO NOT SHOW incompatible degree courses or unsatisfied prereqs
             if only_prereqs_met:
@@ -2417,7 +2495,7 @@ if st.session_state.get("selected_degree"):
                         st.session_state.sug_page += 1
                         st.rerun()
 
-            # --- CSS INJECTION FOR MODERN COURSE ROWS & BADGES ---
+            # --- CSS INJECTION FOR MODERN COURSE ROWS, CAMPUS BADGES & RECOMMENDED TAGS ---
             st.markdown(
                 """
                 <style>
@@ -2444,6 +2522,7 @@ if st.session_state.get("selected_degree"):
                 .tag-area { background: rgba(112, 161, 255, 0.18); color: #70a1ff; border: 1px solid rgba(112, 161, 255, 0.35); }
                 .tag-level { background: rgba(165, 94, 234, 0.18); color: #a55eea; border: 1px solid rgba(165, 94, 234, 0.35); }
                 .tag-off { background: rgba(255, 165, 2, 0.18); color: #ffa502; border: 1px solid rgba(255, 165, 2, 0.35); }
+                .tag-campus { background: rgba(0, 184, 148, 0.18); color: #00cec9; border: 1px solid rgba(0, 206, 201, 0.35); }
                 .tag-cp { background: rgba(255, 255, 255, 0.1); color: #f1f2f6; }
                 .tag-rec { 
                     background: rgba(255, 215, 0, 0.25) !important; 
@@ -2483,6 +2562,10 @@ if st.session_state.get("selected_degree"):
                 lvl_tag = item["level"].split(" ")[0] + " " + item["level"].split(" ")[1]
                 expl = item["explanation"]
 
+                # Campus label
+                camp_lbl = format_campuses_label(c_info.get("campuses", []))
+                camp_tag_html = f'<span class="tag-pill tag-campus">📍 {camp_lbl}</span>' if camp_lbl else ''
+
                 status_class = "status-ready" if item["is_eligible"] else "status-pending"
                 rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if item["is_degree_recommended"] else ''
 
@@ -2502,6 +2585,7 @@ if st.session_state.get("selected_degree"):
                                     <span class="tag-pill tag-level">{lvl_tag}</span>
                                     <span class="tag-pill tag-cp">{cp} CP</span>
                                     <span class="tag-pill tag-off">Offerings: {offs}</span>
+                                    {camp_tag_html}
                                     <span class="tag-pill" style="background:rgba(255,255,255,0.06); color:#a4b0be;">{c_info.get('group', 'General')}</span>
                                 </div>
                                 <div class="{status_class}">
