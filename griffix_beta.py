@@ -848,6 +848,12 @@ def parse_degree_rules(rules_json, degree_code="1031", selected_intake="Trimeste
 def term_index(year: int, trimester: int) -> int:
     return (year - 1) * 3 + trimester
 
+def term_from_index(index: int) -> tuple[int, int]:
+    """Converts a flat term index back to (year, trimester). e.g. 3 -> (1, 3), 4 -> (2, 1)."""
+    yr = (index - 1) // 3 + 1
+    tr = (index - 1) % 3 + 1
+    return yr, tr
+
 def validate_plan(plan: dict, catalog_dict: dict):
     warnings = {}
     satisfied = {}
@@ -890,14 +896,14 @@ def validate_plan(plan: dict, catalog_dict: dict):
                             same_or_later_courses.append((p, p_yr, p_tr))
 
                 if len(satisfied_courses) >= count_needed:
-                    sat_desc = ", ".join([f"{sc[0]} (completed Year {sc[1]} T{sc[2]})" for sc in satisfied_courses[:count_needed]])
+                    sat_desc = ", ".join([f"{sc[0]} (completed Y{sc[1]} T{sc[2]})" for sc in satisfied_courses[:count_needed]])
                     c_sats.append(f"Prerequisite satisfied: {sat_desc}")
                 elif same_or_later_courses:
                     sample = same_or_later_courses[0]
                     if len(g_courses) == 1:
-                        c_warns.append(f"Prereq {sample[0]} must be completed before Year {yr} T{tr} (currently scheduled in Year {sample[1]} T{sample[2]})")
+                        c_warns.append(f"Prereq {sample[0]} must be completed before Y{yr} T{tr} (currently scheduled in Y{sample[1]} T{sample[2]})")
                     else:
-                        c_warns.append(f"Prereq ({' OR '.join(g_courses)}) must be completed before Year {yr} T{tr}")
+                        c_warns.append(f"Prereq ({' OR '.join(g_courses)}) must be completed before Y{yr} T{tr}")
                 else:
                     if len(g_courses) == 1:
                         c_warns.append(f"Missing Prerequisite: {g_courses[0]}")
@@ -911,9 +917,9 @@ def validate_plan(plan: dict, catalog_dict: dict):
                 else:
                     cr_yr, cr_tr = placed_coords[cr]
                     if term_index(cr_yr, cr_tr) <= current_rank:
-                        c_sats.append(f"Corequisite satisfied: {cr} (enrolled Year {cr_yr} T{cr_tr})")
+                        c_sats.append(f"Corequisite satisfied: {cr} (enrolled Y{cr_yr} T{cr_tr})")
                     else:
-                        c_warns.append(f"Coreq {cr} scheduled after Year {yr} T{tr}")
+                        c_warns.append(f"Coreq {cr} scheduled after Y{yr} T{tr}")
 
             # 4. Incompatibility Check
             for inc in incomps:
@@ -1822,57 +1828,70 @@ elif st.session_state.plan:
 # --- ELECTIVE / FLEXIBLE MODULE SUGGESTIONS PANEL ---
 if st.session_state.get("selected_degree") and st.session_state.get("has_flexible_module", False):
     with st.expander("💡 Elective & Flexible Module Suggestions", expanded=False):
-        st.write("Browse recommended electives for your degree. Filter by discipline and year level:")
+        st.write("Browse recommended electives and courses across Griffith. Filter by discipline, level, or search keyword:")
         
         core_set = {c["code"] for c in st.session_state.get("degree_core_courses", [])}
         planned_set = {c for clist in st.session_state.plan.values() for c in clist} | set(st.session_state.holding_zone)
         
         candidates = []
-        # Include recommended flexible courses from program rules
-        for f_code in st.session_state.get("degree_flex_courses", []):
-            if f_code not in core_set and f_code not in planned_set:
-                info = catalog.get(f_code) or lookup_course(f_code) or {}
-                if info:
-                    candidates.append(info)
-                    
-        # Add additional catalog courses from same academic group
-        deg_group = (st.session_state.selected_degree or {}).get("group", "")
-        for c_code, c_info in catalog.items():
-            if c_code not in core_set and c_code not in planned_set and c_code not in [c["code"] for c in candidates]:
-                if deg_group and deg_group.lower() in str(c_info.get("group", "")).lower():
-                    candidates.append(c_info)
+        seen_cand = set()
 
-        col_f1, col_f2 = st.columns(2)
+        # 1. Priority: Recommended flexible courses from the degree rules
+        for f_code in st.session_state.get("degree_flex_courses", []):
+            if f_code not in core_set and f_code not in planned_set and f_code not in seen_cand:
+                info = catalog.get(f_code) or lookup_course(f_code) or {}
+                if info and info.get("code"):
+                    candidates.append(info)
+                    seen_cand.add(f_code)
+                    
+        # 2. General: Include all cached undergraduate courses from the catalog
+        for c_code, c_info in catalog.items():
+            if c_code not in core_set and c_code not in planned_set and c_code not in seen_cand:
+                career = str(c_info.get("career", "")).lower()
+                # Exclude postgraduate/research to suggest valid undergraduate electives
+                if "postgrad" not in career and "research" not in career:
+                    candidates.append(c_info)
+                    seen_cand.add(c_code)
+
+        col_f1, col_f2, col_f3 = st.columns([2, 1.5, 2])
         with col_f1:
             all_groups = sorted(list(set(c.get("group", "Other") for c in candidates if c.get("group"))))
             sel_group = st.selectbox("Filter Discipline / Academic Group", options=["All"] + all_groups, key="sug_filter_grp")
         with col_f2:
             sel_level = st.selectbox("Filter Course Level", options=["All", "Level 1 (1xxx)", "Level 2 (2xxx)", "Level 3 (3xxx)", "Level 4 (4xxx)"], key="sug_filter_lvl")
+        with col_f3:
+            sug_keyword = st.text_input("Filter Keyword / Code", placeholder="e.g. data, ethics, 2020...", key="sug_filter_kw")
 
         # Apply filters
         filtered_sug = []
+        kw = sug_keyword.strip().lower()
         for c in candidates:
             code = c["code"]
             if sel_group != "All" and c.get("group") != sel_group:
                 continue
             if sel_level != "All":
-                lvl_digit = sel_level.split(" ")[1]
-                if not code.startswith(lvl_digit):
+                lvl_digit = sel_level.split(" ")[1][0]
+                if not code[0].isdigit() or code[0] != lvl_digit:
                     continue
+            if kw and kw not in code.lower() and kw not in c.get("title", "").lower():
+                continue
             filtered_sug.append(c)
 
         if not filtered_sug:
             st.caption("No elective suggestions match the selected filters.")
         else:
+            st.caption(f"Showing top {min(15, len(filtered_sug))} of {len(filtered_sug)} matching courses:")
             placed_coords = {c: (yr, tr) for (yr, tr), clist in st.session_state.plan.items() for c in clist}
-            for c_info in filtered_sug[:12]:
+
+            for c_info in filtered_sug[:15]:
                 c_code = c_info["code"]
                 title = c_info["title"]
                 cp = c_info.get("credit_points", "10")
                 offs = format_offerings_label(c_info.get("offerings", []))
                 p_groups = c_info.get("prereq_groups", [])
 
-                prereq_status_str = "No Prerequisites"
+                # Calculate prerequisite readiness
+                prereq_status_str = "✅ No Prerequisites • Ready for Y1 T1"
                 if p_groups:
                     latest_term = 0
                     all_sat = True
@@ -1887,12 +1906,17 @@ if st.session_state.get("selected_degree") and st.session_state.get("has_flexibl
                         if sat_in_g < needed:
                             all_sat = False
                             break
+
                     if all_sat:
-                        prereq_status_str = f"✅ Prereqs satisfied! Ready from Term Index {latest_term + 1}"
+                        if latest_term == 0:
+                            prereq_status_str = "✅ Prereqs satisfied! Ready for Y1 T1"
+                        else:
+                            ready_yr, ready_tr = term_from_index(latest_term + 1)
+                            prereq_status_str = f"✅ Prereqs satisfied! Ready from Y{ready_yr} T{ready_tr}"
                     else:
                         prereq_status_str = f"⏳ Prereqs needed: {format_prereq_display(p_groups)}"
 
-                col_info, col_btn = st.columns([4, 1])
+                col_info, col_btn = st.columns([4.2, 0.8])
                 with col_info:
                     st.markdown(f"**{c_code}** — {title} (`{cp} CP` • `{offs}`)")
                     st.caption(f"{prereq_status_str} | *{c_info.get('group', 'General')}*")
