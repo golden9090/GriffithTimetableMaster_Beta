@@ -2842,10 +2842,10 @@ if st.session_state.get("selected_degree"):
                         st.rerun()
 
             # --- CSS FOR PERFECT ROW ALIGNMENT, NO TRUNCATION & SOLID BADGES ---
+            # --- CSS FOR PERFECT 1-LINE HORIZONTAL ALIGNMENT ---
             st.markdown(
                 """
                 <style>
-                /* Align the card and button horizontally and center them vertically */
                 div[data-testid="stHorizontalBlock"]:has(.sug-card) {
                     align-items: center !important;
                     margin-bottom: 9px !important;
@@ -2857,7 +2857,7 @@ if st.session_state.get("selected_degree"):
                 div[data-testid="stHorizontalBlock"]:has(.sug-card) button {
                     margin: 0 !important;
                     white-space: nowrap !important;
-                    min-height: 40px !important;
+                    min-height: 38px !important;
                 }
 
                 .sug-card {
@@ -2874,9 +2874,10 @@ if st.session_state.get("selected_degree"):
                     background: rgba(255, 255, 255, 0.05);
                 }
 
-                /* Locks all tags into one perfectly level horizontal row */
+                /* Container forces perfect cross-axis centering with no wrapping */
                 .tags-row {
                     display: flex !important;
+                    flex-direction: row !important;
                     align-items: center !important;
                     flex-wrap: nowrap !important;
                     gap: 6px !important;
@@ -2891,30 +2892,30 @@ if st.session_state.get("selected_degree"):
                     display: none;
                 }
 
-                /* Uniform 22px height & vertical centering for every pill */
+                /* Locks EVERY pill to an identical 20px height, 20px line-height, and 1px border */
                 .tag-pill {
                     display: inline-flex !important;
                     align-items: center !important;
                     justify-content: center !important;
                     vertical-align: middle !important;
                     box-sizing: border-box !important;
-                    height: 22px !important;
+                    height: 20px !important;
+                    line-height: 20px !important;
                     padding: 0 8px !important;
+                    margin: 0 !important;
                     border-radius: 4px !important;
                     font-size: 10px !important;
                     font-weight: 700 !important;
-                    line-height: 1 !important;
                     white-space: nowrap !important;
                     flex-shrink: 0 !important;
                 }
 
-                .tag-area { background: rgba(112, 161, 255, 0.18); color: #70a1ff; border: 1px solid rgba(112, 161, 255, 0.35); }
-                .tag-level { background: rgba(165, 94, 234, 0.18); color: #a55eea; border: 1px solid rgba(165, 94, 234, 0.35); }
-                .tag-off { background: rgba(255, 165, 2, 0.18); color: #ffa502; border: 1px solid rgba(255, 165, 2, 0.35); }
-                .tag-cp { background: rgba(255, 255, 255, 0.08); color: #f1f2f6; border: 1px solid rgba(255, 255, 255, 0.15); }
+                .tag-area { background: rgba(112, 161, 255, 0.18) !important; color: #70a1ff !important; border: 1px solid rgba(112, 161, 255, 0.35) !important; }
+                .tag-level { background: rgba(165, 94, 234, 0.18) !important; color: #a55eea !important; border: 1px solid rgba(165, 94, 234, 0.35) !important; }
+                .tag-off { background: rgba(255, 165, 2, 0.18) !important; color: #ffa502 !important; border: 1px solid rgba(255, 165, 2, 0.35) !important; }
+                .tag-cp { background: rgba(255, 255, 255, 0.08) !important; color: #f1f2f6 !important; border: 1px solid rgba(255, 255, 255, 0.15) !important; }
                 .tag-group { background: rgba(255, 255, 255, 0.08) !important; color: #d1d8e0 !important; border: 1px solid rgba(255, 255, 255, 0.15) !important; }
 
-                /* 100% Solid Non-Transparent Campus Badges */
                 .tag-campus { 
                     background: #00564d !important; 
                     color: #ffffff !important; 
@@ -2973,6 +2974,22 @@ if st.session_state.get("selected_degree"):
 
                 rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if item["is_degree_recommended"] else ''
 
+                # Build all tags in a single compact string with ZERO whitespace or newlines between elements
+                tags_html_list = [
+                    f'<span class="tag-pill tag-area">{area_tag}</span>',
+                    f'<span class="tag-pill tag-level">{lvl_tag}</span>',
+                    f'<span class="tag-pill tag-cp">{cp} CP</span>',
+                    f'<span class="tag-pill tag-off">Offerings: {offs}</span>',
+                ]
+                if camp_tag_html:
+                    tags_html_list.append(camp_tag_html)
+                
+                group_name = c_info.get('group', 'General')
+                tags_html_list.append(f'<span class="tag-pill tag-group">{group_name}</span>')
+                
+                # Zero newline / whitespace insertion
+                joined_tags_html = "".join(tags_html_list)
+
                 with st.container():
                     try:
                         c_main, c_btn = st.columns([4.85, 1.15], vertical_alignment="center")
@@ -2981,26 +2998,7 @@ if st.session_state.get("selected_degree"):
 
                     with c_main:
                         st.markdown(
-                            f"""
-<div class="sug-card">
-<div style="display:flex; justify-content:space-between; align-items:center;">
-<span style="font-size:13.5px; font-weight:700;">
-{c_code} — {title} {rec_badge}
-</span>
-</div>
-<div class="tags-row">
-<span class="tag-pill tag-area">{area_tag}</span>
-<span class="tag-pill tag-level">{lvl_tag}</span>
-<span class="tag-pill tag-cp">{cp} CP</span>
-<span class="tag-pill tag-off">Offerings: {offs}</span>
-{camp_tag_html}
-<span class="tag-pill tag-group">{c_info.get('group', 'General')}</span>
-</div>
-<div class="{status_class}">
-{expl}
-</div>
-</div>
-                            """,
+                            f"""<div class="sug-card"><div style="display:flex; justify-content:space-between; align-items:center;"><span style="font-size:13.5px; font-weight:700;">{c_code} — {title} {rec_badge}</span></div><div class="tags-row">{joined_tags_html}</div><div class="{status_class}">{expl}</div></div>""",
                             unsafe_allow_html=True
                         )
                     with c_btn:
