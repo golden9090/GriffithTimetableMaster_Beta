@@ -128,7 +128,7 @@ def get_course_level_label(code_str: str) -> str:
     return "Other Level"
 
 # -----------------------------------------------------------------------------
-# 3. REQUISITES & OFFERINGS PARSER
+# 3. REQUISITES & OFFERINGS PARSER (CP-AWARE & PROGRAM-AWARE)
 # -----------------------------------------------------------------------------
 def extract_course_codes(text: str):
     """Finds valid Griffith course codes."""
@@ -156,6 +156,28 @@ def extract_program_restrictions(desc: str) -> list:
             if c not in restricted:
                 restricted.append(c)
     return restricted
+
+def extract_cp_prereq(rule_def: str = "", rule_sum: str = "", desc: str = "") -> int:
+    """Extracts minimum prior credit points required (e.g. 80 CP in 3002LFC)."""
+    combined = f"{rule_def} {rule_sum} {desc}".upper()
+    
+    # 1. Match UNITS (80)
+    m = re.search(r'UNITS\s*\((\d+)\)', combined)
+    if m:
+        return int(m.group(1))
+        
+    # 2. Match phrases like 'completed at least 80 credit points', 'completion of 130CP'
+    m2 = re.search(r'(?:COMPLET(?:ED?|ION OF)|ACHIEVED?|EARNED?)\s*(?:AT LEAST\s*)?(\d{2,3})\s*(?:CREDIT POINTS|CP|UNITS)', combined)
+    if m2:
+        return int(m2.group(1))
+        
+    # 3. Match '80CP completed' or '80 credit points prior'
+    m3 = re.search(r'(\d{2,3})\s*(?:CREDIT POINTS|CP|UNITS)\s*(?:PRIOR TO|COMPLETED|ACHIEVED)', combined)
+    if m3:
+        return int(m3.group(1))
+        
+    return 0
+
 
 def parse_rule_definition_to_groups(rule_def: str, rule_sum: str = "") -> list:
     """Parses Curriculum API ruleDefinition accurately into AND / OR course groups."""
@@ -266,6 +288,9 @@ def is_course_offered_in_term(c_info: dict, trimester: int) -> bool:
 # -----------------------------------------------------------------------------
 # 5. FULL CATALOG LOADER (PAGINATED FOR COMPLETE ~2,700+ COURSES)
 # -----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# 5. CATALOG & LIVE CURRICULUM LOOKUP (FULL PAGINATED UNIVERSITY REGISTRY)
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_full_catalog():
     """Fetches ALL ~2,727 courses across Griffith using Funnelback pagination."""
@@ -301,10 +326,11 @@ def load_full_catalog():
                 career = meta.get("academicCareerName", ["Undergraduate"])[0]
                 group = meta.get("academicGrpDescription", ["Other"])[0]
 
-                # Parse Requisites & Restrictions
+                # Parse Requisites, CP Prerequisites & Program Restrictions
                 p_match = re.search(r'(?:pre-?requisite(?:s)?|advised prerequisite(?:s)?)\s*[:\-]?\s*([^.;\n]+)', desc, re.I)
                 p_text = p_match.group(1) if p_match and "nil" not in p_match.group(1).lower() else ""
                 fallback_groups = parse_rule_definition_to_groups("", p_text)
+                min_cp = extract_cp_prereq("", "", desc)
                 prog_restrictions = extract_program_restrictions(desc)
                 subject_area = get_course_subject_area(code)
 
@@ -319,6 +345,7 @@ def load_full_catalog():
                     "subject_area": subject_area,
                     "prereq_groups": fallback_groups,
                     "prereq_display": format_prereq_display(fallback_groups),
+                    "min_cp_prereq": min_cp,
                     "coreqs": extract_coreqs(desc),
                     "incompatibles": extract_incompatibles(desc),
                     "program_restrictions": prog_restrictions
@@ -369,12 +396,18 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     mapped = data.get("mappedData", {}).get("components", {})
 
                     prereq_groups, coreqs, incompatibles = [], [], []
+                    min_cp = 0
                     req_obj = mapped.get("crseRequiste", {}).get("value", {})
                     if isinstance(req_obj, dict):
                         for r in req_obj.get("requisites", []):
                             rtype = str(r.get("type", "")).upper()
                             rule_def = str(r.get("ruleDefinition", ""))
                             rule_sum = str(r.get("ruleSummary", ""))
+
+                            # Check Credit Point requirements (UNITS 80)
+                            cp_req = extract_cp_prereq(rule_def, rule_sum, "")
+                            if cp_req > min_cp:
+                                min_cp = cp_req
 
                             if "PRE" in rtype:
                                 groups = parse_rule_definition_to_groups(rule_def, rule_sum)
@@ -393,6 +426,10 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     other_req = mapped.get("crseOthrRequiste", {}).get("value") or ""
                     desc_text = mapped.get("crseDescr", {}).get("value", "")
                     combined_req_text = f"{other_req} {desc_text}"
+
+                    desc_cp = extract_cp_prereq("", "", combined_req_text)
+                    if desc_cp > min_cp:
+                        min_cp = desc_cp
 
                     incomp_match = re.search(r'(?:incompatible(?:s)?|anti-?requisite(?:s)?)\s*[:\-]?\s*([^.;\n<]+)', combined_req_text, re.I)
                     if incomp_match:
@@ -421,6 +458,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                         "subject_area": get_course_subject_area(clean_code),
                         "prereq_groups": prereq_groups,
                         "prereq_display": format_prereq_display(prereq_groups),
+                        "min_cp_prereq": min_cp,
                         "coreqs": list(dict.fromkeys(coreqs)),
                         "incompatibles": list(dict.fromkeys(incompatibles)),
                         "program_restrictions": prog_restrictions
@@ -453,22 +491,7 @@ def lookup_course(clean_code: str, selected_year: int = None):
 # -----------------------------------------------------------------------------
 def get_fallback_degrees():
     raw_list = [
-        {"code": "1031", "title": "Bachelor of Biomedical Science", "campuses": ["Brisbane South", "Nathan"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Sciences"},
-        {"code": "1094", "title": "Bachelor of Biomedical Science", "campuses": ["Gold Coast"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Health"},
-        {"code": "1280", "title": "Bachelor of Medical Science", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1"], "duration_years": 2, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Health"},
-        {"code": "1162", "title": "Bachelor of Nursing", "campuses": ["Gold Coast", "Logan", "Brisbane South"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Health"},
-        {"code": "1577", "title": "Bachelor of Dental Health Science", "campuses": ["Gold Coast"], "intakes": ["Trimester 1"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Health"},
-        {"code": "1590", "title": "Bachelor of Physiotherapy (Honours)", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1"], "duration_years": 4, "career": "Undergraduate", "total_cp": 320, "group": "Griffith Health"},
-        {"code": "2004", "title": "Bachelor of Psychological Science (Honours)", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1"], "duration_years": 1, "career": "Undergraduate", "total_cp": 80, "group": "Griffith Health"},
-        {"code": "1012", "title": "Bachelor of Psychological Science", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1", "Trimester 2", "Trimester 3"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Health"},
-        {"code": "1619", "title": "Bachelor of Laws (Honours)", "campuses": ["Gold Coast", "Brisbane City"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 4, "career": "Undergraduate", "total_cp": 320, "group": "Arts, Education and Law Group"},
-        {"code": "1662", "title": "Bachelor of Occupational Therapy (Honours)", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1"], "duration_years": 4, "career": "Undergraduate", "total_cp": 320, "group": "Griffith Health"},
-        {"code": "1533", "title": "Bachelor of Paramedicine", "campuses": ["Gold Coast"], "intakes": ["Trimester 1"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Health"},
-        {"code": "1546", "title": "Bachelor of Engineering (Honours)", "campuses": ["Gold Coast", "Brisbane South"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 4, "career": "Undergraduate", "total_cp": 320, "group": "Griffith Sciences"},
-        {"code": "1632", "title": "Bachelor of Business", "campuses": ["Online", "Gold Coast", "Brisbane City", "Brisbane South"], "intakes": ["Trimester 1", "Trimester 2", "Trimester 3"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Business School"},
-        {"code": "1354", "title": "Bachelor of Midwifery", "campuses": ["Logan"], "intakes": ["Trimester 1"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Health"},
-        {"code": "1540", "title": "Bachelor of Biomolecular Science (Honours)", "campuses": ["Brisbane South"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 4, "career": "Undergraduate", "total_cp": 320, "group": "Griffith Sciences"}
-    ]
+        {"code": "1031", "title": "Bachelor of Biomedical Science", "campuses": ["Brisbane South", "Nathan"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Sciences"}]
     for d in raw_list:
         d["campuses"] = list(dict.fromkeys(normalize_campus_name(c) for c in d["campuses"]))
     return raw_list
@@ -902,10 +925,26 @@ def validate_plan(plan: dict, catalog_dict: dict):
             prereq_groups = info.get("prereq_groups", [])
             coreqs = info.get("coreqs", [])
             incomps = info.get("incompatibles", [])
+            min_cp = info.get("min_cp_prereq", 0)
 
+            # 1. Offering Check
             if not is_course_offered_in_term(info, tr):
                 c_warns.append(f"Not usually offered in Trimester {tr}")
 
+            # 2. Minimum Prior Credit Points Check (e.g. 80 CP for 3002LFC)
+            if min_cp > 0:
+                prior_cp = sum(
+                    int((catalog_dict.get(pc) or lookup_course(pc) or {}).get("credit_points", 10) or 10)
+                    for (pyr, ptr), clist in plan.items()
+                    if term_index(pyr, ptr) < current_rank
+                    for pc in clist
+                )
+                if prior_cp < min_cp:
+                    c_warns.append(f"Requires at least {min_cp} CP completed prior (currently completed: {prior_cp} CP)")
+                else:
+                    c_sats.append(f"Credit point requirement satisfied: {prior_cp}/{min_cp} CP completed prior")
+
+            # 3. Course Prerequisites Check
             for group in prereq_groups:
                 g_courses = group.get("courses", [])
                 count_needed = group.get("count", 1)
@@ -936,6 +975,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
                     else:
                         c_warns.append(f"Missing Prerequisite: Complete at least {count_needed} of ({' OR '.join(g_courses)})")
 
+            # 4. Corequisites Check
             for cr in coreqs:
                 if cr not in placed_coords:
                     c_warns.append(f"Missing Corequisite: {cr}")
@@ -946,6 +986,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
                     else:
                         c_warns.append(f"Coreq {cr} scheduled after Y{yr} T{tr}")
 
+            # 5. Incompatibilities Check
             for inc in incomps:
                 if inc in all_planned and inc != c:
                     c_warns.append(f"Incompatible with {inc}")
@@ -957,34 +998,56 @@ def validate_plan(plan: dict, catalog_dict: dict):
 
     return warnings, satisfied
 
-def evaluate_elective_prereqs(c_info: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
+def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
     """
-    Checks if a candidate course can be taken SOME TIME in the program:
-    1. Checks program restrictions (e.g. 'must be undertaking 1651').
+    Checks if an elective can be taken SOME TIME during the program:
+    1. Checks program restrictions (e.g. 'Must be undertaking 1651').
     2. Checks incompatibility with scheduled courses.
-    3. Checks if all prerequisite groups are satisfied by courses scheduled in the degree.
+    3. Checks CP prerequisites (e.g. '80 CP completed').
+    4. Checks if all prerequisite groups are satisfied by courses scheduled in the degree.
     """
     code = c_info.get("code")
 
-    # 1. Degree / Program Restriction
+    # 1. Program / Degree Restriction
     prog_restr = c_info.get("program_restrictions", [])
     if prog_restr and selected_degree_code:
         if selected_degree_code not in prog_restr:
             return False, None, f"Restricted to program(s): {', '.join(prog_restr)}", []
 
-    # 2. Incompatibles
+    # 2. Incompatibility
     incomps = c_info.get("incompatibles", [])
     for inc in incomps:
         if inc in planned_coords:
             pyr, ptr = planned_coords[inc]
             return False, None, f"Incompatible with {inc} (in plan Y{pyr} T{ptr})", []
 
-    # 3. Prerequisites
-    p_groups = c_info.get("prereq_groups", [])
-    if not p_groups:
-        return True, (1, 1), "No prerequisites — Ready for Year 1 Trimester 1", []
+    # Calculate cumulative CP progression by term to evaluate 80CP/120CP prerequisites
+    sorted_terms = sorted(plan.keys(), key=lambda t: term_index(t[0], t[1]))
+    cum_cp_before_term = {}
+    running_cp = 0
+    for t in sorted_terms:
+        cum_cp_before_term[t] = running_cp
+        term_courses = plan[t]
+        running_cp += sum(int((catalog.get(tc) or {}).get("credit_points", 10) or 10) for tc in term_courses)
 
-    latest_term = 0
+    # 3. CP Prerequisite Check (e.g. 80 CP for 3002LFC)
+    min_cp = c_info.get("min_cp_prereq", 0)
+    latest_term_cp = 0
+    cp_sat_msg = ""
+    if min_cp > 0:
+        eligible_term_for_cp = None
+        for t in sorted_terms:
+            if cum_cp_before_term[t] >= min_cp:
+                eligible_term_for_cp = t
+                break
+        if not eligible_term_for_cp:
+            return False, None, f"Requires at least {min_cp} CP completed prior (your plan only reaches {running_cp} CP)", []
+        latest_term_cp = term_index(eligible_term_for_cp[0], eligible_term_for_cp[1]) - 1
+        cp_sat_msg = f"{min_cp} CP completed"
+
+    # 4. Course Prerequisites Check
+    p_groups = c_info.get("prereq_groups", [])
+    latest_term_courses = 0
     missing_groups = []
     sat_details = []
 
@@ -1002,16 +1065,28 @@ def evaluate_elective_prereqs(c_info: dict, planned_coords: dict, selected_degre
             missing_groups.append(g)
         else:
             for sc in sat_in_g[:needed]:
-                latest_term = max(latest_term, term_index(sc[1], sc[2]))
+                latest_term_courses = max(latest_term_courses, term_index(sc[1], sc[2]))
                 sat_details.append(f"{sc[0]} (Y{sc[1]} T{sc[2]})")
 
     if missing_groups:
         missing_str = format_prereq_display(missing_groups)
         return False, None, f"Prerequisites needed: {missing_str}", missing_groups
 
-    ready_yr, ready_tr = term_from_index(latest_term + 1)
-    sat_summary = ", ".join(sat_details)
-    return True, (ready_yr, ready_tr), f"Prerequisites met via {sat_summary} — Eligible from Year {ready_yr} Trimester {ready_tr}", []
+    # Combine Course and CP eligibility
+    overall_latest_rank = max(latest_term_courses, latest_term_cp)
+    ready_yr, ready_tr = term_from_index(overall_latest_rank + 1) if overall_latest_rank > 0 else (1, 1)
+
+    all_sat_reasons = []
+    if cp_sat_msg:
+        all_sat_reasons.append(cp_sat_msg)
+    if sat_details:
+        all_sat_reasons.append(", ".join(sat_details))
+
+    if all_sat_reasons:
+        reasons_str = " & ".join(all_sat_reasons)
+        return True, (ready_yr, ready_tr), f"Prerequisites met via {reasons_str} — Eligible from Year {ready_yr} Trimester {ready_tr}", []
+
+    return True, (1, 1), "No prerequisites required — Eligible from Year 1 Trimester 1", []
 
 plan_warnings, plan_satisfied = validate_plan(st.session_state.plan, catalog)
 
@@ -1843,11 +1918,11 @@ elif st.session_state.plan:
     st.success("✅ All scheduled courses satisfy prerequisite, corequisite, and offering constraints.")
 
 # -----------------------------------------------------------------------------
-# 12. ADVANCED ELECTIVE & UNIVERSAL COURSE EXPLORER
+# 12. ADVANCED ELECTIVE & UNIVERSAL COURSE EXPLORER (FULL CATALOG ~3,000 COURSES)
 # -----------------------------------------------------------------------------
 if st.session_state.get("selected_degree"):
-    with st.expander("💡 Elective & University Course Explorer (Full ~3,000 Catalog)", expanded=False):
-        st.write("Browse and filter across the complete Griffith course catalog. Automatically checks if you satisfy prerequisites based on your scheduled degree progression:")
+    with st.expander("💡 Elective & University Course Explorer (Full Catalog)", expanded=False):
+        st.write("Browse and filter across the complete Griffith course catalog. Automatically checks prerequisite & 80CP eligibility across your entire degree plan:")
 
         if "sug_page" not in st.session_state:
             st.session_state.sug_page = 1
@@ -1860,29 +1935,31 @@ if st.session_state.get("selected_degree"):
         candidates = []
         seen_cand = set()
 
-        # 1. Degree Recommended Flexible Courses
+        # 1. Degree Recommended Flexible Courses (Placed First)
         for f_code in st.session_state.get("degree_flex_courses", []):
             if f_code not in core_set and f_code not in planned_or_held and f_code not in seen_cand:
                 info = catalog.get(f_code) or lookup_course(f_code) or {}
                 if info and info.get("code"):
-                    info["is_degree_recommended"] = True
-                    candidates.append(info)
+                    c_copy = dict(info)
+                    c_copy["is_degree_recommended"] = True
+                    candidates.append(c_copy)
                     seen_cand.add(f_code)
 
-        # 2. Universal Course Catalog across all faculties
+        # 2. Universal Course Catalog across all faculties (e.g. ALL MSC, ESC, NSC courses)
         for c_code, c_info in catalog.items():
             if c_code not in core_set and c_code not in planned_or_held and c_code not in seen_cand:
                 career = str(c_info.get("career", "")).lower()
-                # Undergraduate awards prioritize UG electives
+                # Exclude postgraduate-only or research theses for undergraduate planners
                 if "postgrad" not in career and "research" not in career:
-                    c_info["is_degree_recommended"] = False
-                    candidates.append(c_info)
+                    c_copy = dict(c_info)
+                    c_copy["is_degree_recommended"] = False
+                    candidates.append(c_copy)
                     seen_cand.add(c_code)
 
-        # Evaluate Whole-Degree Prerequisite Satisfaction
+        # Evaluate Whole-Degree Prerequisite Satisfaction & CP requirements
         candidate_evaluations = []
         for c in candidates:
-            is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(c, planned_coords, sel_deg_code)
+            is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(c, st.session_state.plan, planned_coords, sel_deg_code)
             lvl_lbl = get_course_level_label(c["code"])
             subj_area = c.get("subject_area") or get_course_subject_area(c["code"])
             rank_score = term_index(early_term[0], early_term[1]) if early_term else 9999
@@ -1930,10 +2007,10 @@ if st.session_state.get("selected_degree"):
             sug_keyword = st.text_input("Search Keyword or Code", placeholder="e.g. data, biostatistics, 2022...", key="sug_filter_kw")
         with col_tgl:
             only_prereqs_met = st.checkbox(
-                "Only show courses where prerequisites are satisfied in your program",
+                "Only show courses with prerequisites satisfied in plan",
                 value=True,
                 key="sug_filter_prereq_met",
-                help="Filters to courses with no prerequisites or where all prerequisites are satisfied by courses scheduled in your degree matrix."
+                help="Filters to courses with no prerequisites, satisfied course prerequisites, or satisfied credit-point requirements (e.g. 80 CP)."
             )
         with col_pp:
             per_page = st.selectbox("Per Page", options=[10, 25, 50], index=0, key="sug_per_page")
