@@ -9,6 +9,8 @@ import difflib
 import urllib.parse
 from datetime import datetime
 import os
+import difflib
+import time
 
 st.warning("**IMPORTANT**: THIS SITE IS A BETA VERSION OF GRIFFIX FEATURES, AND ONLY INCLUDES **EXPERIMENTAL FEATURES UNDERGOING TESTING**. ACCESS THE OFFICIAL VERSION OF GRIFFIX [HERE](https://griffix.streamlit.app)")
 st.error("**WARNING**: THIS SITE DOES **NOT** SAVE WHAT YOU HAVE ON YOUR SCREEN AFTER YOU REFRESH OR CLOSE THE PAGE.")
@@ -632,66 +634,122 @@ def parse_degree_results(results):
     print(f"[DEGREE PARSER] Successfully parsed {len(degrees)} degrees.", flush=True)
     return degrees
 
+# -----------------------------------------------------------------------------
+# CLOUDFLARE BYPASS CLIENT (TLS IMPERSONATION)
+# -----------------------------------------------------------------------------
+try:
+    from curl_cffi import requests as cureq
+    HAS_CURL_CFFI = True
+    print("[INIT] ✅ curl_cffi is available. Chrome TLS spoofing enabled.", flush=True)
+except ImportError:
+    HAS_CURL_CFFI = False
+    print("[INIT] ⚠️ curl_cffi not installed. Standard requests will be used.", flush=True)
 
+CHROME_HEADERS = {
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-AU,en-US;q=0.9,en;q=0.8",
+    "Origin": "https://www.griffith.edu.au",
+    "Referer": "https://www.griffith.edu.au/",
+    "Sec-Ch-Ua": '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+    "Sec-Ch-Ua-Mobile": "?0",
+    "Sec-Ch-Ua-Platform": '"Windows"',
+    "Sec-Fetch-Dest": "empty",
+    "Sec-Fetch-Mode": "cors",
+    "Sec-Fetch-Site": "same-site",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+}
+
+def cloudflare_safe_get(url: str, timeout: int = 15):
+    """
+    Performs an HTTP GET request that impersonates real Chrome browser TLS fingerprints
+    to bypass Cloudflare's 403 'Just a moment...' WAF challenge.
+    """
+    if HAS_CURL_CFFI:
+        try:
+            # Impersonate Chrome 124 TLS & HTTP/2 framing
+            resp = cureq.get(
+                url,
+                headers=CHROME_HEADERS,
+                impersonate="chrome124",
+                timeout=timeout
+            )
+            return resp.status_code, resp.json() if resp.status_code == 200 else resp.text
+        except Exception as e:
+            print(f"[CLOUDFLARE BYPASS] curl_cffi error: {e}", flush=True)
+
+    # Fallback to standard requests if curl_cffi is absent or fails
+    try:
+        import requests
+        resp = requests.get(url, headers=CHROME_HEADERS, timeout=timeout)
+        return resp.status_code, resp.json() if resp.status_code == 200 else resp.text
+    except Exception as e:
+        return 0, str(e)
+
+
+def find_project_file(filename: str):
+    """Finds a local file regardless of execution directory."""
+    script_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else "."
+    candidates = [
+        os.path.join(script_dir, filename),
+        os.path.join(os.getcwd(), filename),
+        os.path.join(os.getcwd(), "data", filename),
+        filename
+    ]
+    for path in candidates:
+        if os.path.isfile(path):
+            return path
+    return None
+
+# -----------------------------------------------------------------------------
+# 6. DEGREE CATALOG FETCHER WITH 403 BYPASS
+# -----------------------------------------------------------------------------
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_all_degrees_catalog():
     """
-    Fetches all ~283 Griffith degrees in ONE call using num_ranks=500.
-    Does NOT use ?query= to avoid Cloudflare bot blocking.
+    Fetches the 500-degree catalog using Chrome TLS spoofing to bypass 403 blocks.
+    Falls back to local degree_data1json.json if Cloudflare blocks the hosting IP.
     """
     url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=500&start_rank=1"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Accept": "application/json, text/plain, */*",
-        "Accept-Language": "en-AU,en-US;q=0.9,en;q=0.8",
-        "Referer": "https://www.griffith.edu.au/",
-        "Origin": "https://www.griffith.edu.au"
-    }
-
     print("\n" + "="*70, flush=True)
-    print(f"[DEGREE SERVICE] Fetching full degrees list from:\n  -> {url}", flush=True)
+    print(f"[DEGREE SERVICE] Fetching 500 degrees with Chrome TLS spoofing from:\n  -> {url}", flush=True)
 
-    try:
-        t0 = time.time()
-        resp = requests.get(url, headers=headers, timeout=15)
-        elapsed = time.time() - t0
-        print(f"[DEGREE SERVICE] HTTP Status: {resp.status_code} ({elapsed:.2f}s)", flush=True)
+    t0 = time.time()
+    status_code, response_data = cloudflare_safe_get(url, timeout=15)
+    elapsed = time.time() - t0
+    print(f"[DEGREE SERVICE] Response status: {status_code} in {elapsed:.2f}s", flush=True)
 
-        if resp.status_code == 200:
-            data = resp.json()
-            packet = data.get("response", {}).get("resultPacket", {})
-            results = packet.get("results", [])
-            total_matching = packet.get("resultsSummary", {}).get("totalMatching", 0)
-            print(f"[DEGREE SERVICE] Funnelback reports totalMatching: {total_matching}, received: {len(results)}", flush=True)
+    # If the bypass succeeds (HTTP 200)
+    if status_code == 200 and isinstance(response_data, dict):
+        packet = response_data.get("response", {}).get("resultPacket", {})
+        results = packet.get("results", [])
+        total_matching = packet.get("resultsSummary", {}).get("totalMatching", 0)
+        print(f"[DEGREE SERVICE] ✅ Cloudflare bypassed! Received {len(results)}/{total_matching} degrees.", flush=True)
 
-            parsed = parse_degree_results(results)
-            if parsed:
-                print(f"[DEGREE SERVICE] ✅ Successfully cached {len(parsed)} degrees in memory.", flush=True)
-                print("="*70 + "\n", flush=True)
-                return parsed
-        else:
-            print(f"[DEGREE SERVICE] ⚠️ Live endpoint returned {resp.status_code}. Checking local files...", flush=True)
+        parsed = parse_degree_results(results)
+        if parsed:
+            print("="*70 + "\n", flush=True)
+            return parsed
 
-    except Exception as e:
-        print(f"[DEGREE SERVICE] ⚠️ Network request failed: {e}. Checking local files...", flush=True)
+    print(f"[DEGREE SERVICE] ⚠️ Live request returned {status_code}. Checking local file fallback...", flush=True)
 
-    # Local fallback if degree_data1json.json is placed in your project directory
-    for local_filename in ["degree_data1json.json", "degrees.json"]:
-        if os.path.exists(local_filename):
-            print(f"[DEGREE SERVICE] Loading degrees from local file: {local_filename}", flush=True)
+    # Check local saved file
+    for filename in ["degree_data1json.json", "degrees.json"]:
+        local_path = find_project_file(filename)
+        if local_path:
+            print(f"[DEGREE SERVICE] Loading local fallback file: {local_path}", flush=True)
             try:
-                with open(local_filename, "r", encoding="utf-8") as f:
-                    local_data = json.load(f)
-                    local_results = local_data.get("response", {}).get("resultPacket", {}).get("results", [])
-                    parsed = parse_degree_results(local_results)
+                with open(local_path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+                    parsed = parse_degree_results(results)
                     if parsed:
-                        print(f"[DEGREE SERVICE] ✅ Loaded {len(parsed)} degrees from {local_filename}.", flush=True)
+                        print(f"[DEGREE SERVICE] ✅ Loaded {len(parsed)} degrees from {local_path}.", flush=True)
                         print("="*70 + "\n", flush=True)
                         return parsed
             except Exception as e:
-                print(f"[DEGREE SERVICE] Error reading {local_filename}: {e}", flush=True)
+                print(f"[DEGREE SERVICE] Failed reading {local_path}: {e}", flush=True)
 
-    print("[DEGREE SERVICE] ⚠️ Using static fallback degrees.", flush=True)
+    print("[DEGREE SERVICE] ⚠️ Falling back to built-in static degrees.", flush=True)
     print("="*70 + "\n", flush=True)
     return get_fallback_degrees()
 
