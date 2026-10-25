@@ -135,7 +135,7 @@ def get_course_level_label(code_str: str) -> str:
     return "Other Level"
 
 def format_campuses_label(campuses_list) -> str:
-    """Formats campuses list into concise badge text (e.g. 'Gold Coast', 'Nathan, GC')."""
+    """Formats campuses list into concise badge text."""
     if not campuses_list:
         return ""
     clean = []
@@ -156,6 +156,28 @@ def format_campuses_label(campuses_list) -> str:
     dedup = list(dict.fromkeys(clean))
     return ", ".join(dedup) if dedup else ""
 
+def get_campus_badge_data(campuses_list: list, home_campus: str = None) -> tuple[str, bool]:
+    """
+    Returns (campus_display_string, is_warning_mismatch).
+    Matches Nathan and Brisbane South (Nathan) identically.
+    Flags warning if the course does not offer the student's home campus.
+    """
+    if not campuses_list:
+        return "", False
+
+    camp_str = format_campuses_label(campuses_list)
+    if not camp_str or not home_campus:
+        return camp_str, False
+
+    # Normalize both home campus and course campuses identically
+    norm_home = normalize_campus_name(home_campus).strip().lower()
+    norm_course_camps = [normalize_campus_name(c).strip().lower() for c in campuses_list]
+
+    # Nathan and Brisbane South (Nathan) both normalize to 'brisbane south (nathan)'
+    has_home = any(norm_home == c or norm_home in c or c in norm_home for c in norm_course_camps)
+
+    is_warning = not has_home
+    return camp_str, is_warning
 # -----------------------------------------------------------------------------
 # 3. REQUISITES & OFFERINGS PARSER (CP-AWARE & PROGRAM-AWARE)
 # -----------------------------------------------------------------------------
@@ -1988,6 +2010,22 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         box-shadow: 0 0 14px rgba(255, 71, 87, 0.9) !important;
     }
 
+    .badge-campus-ok {
+        background: #00564d !important;
+        color: #ffffff !important;
+        border: 1px solid #00b894 !important;
+        font-weight: 700 !important;
+        opacity: 1 !important;
+    }
+    .badge-campus-warn {
+        background: #8b0000 !important;
+        color: #ffffff !important;
+        border: 1.5px solid #ff4d4d !important;
+        font-weight: 800 !important;
+        opacity: 1 !important;
+        box-shadow: 0 0 6px rgba(255, 77, 77, 0.6) !important;
+    }
+
     .holding-grid {
         display: grid;
         grid-template-columns: repeat(auto-fill, minmax(215px, 1fr));
@@ -2093,7 +2131,8 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
     if not holding_zone:
         html += "<div style='color: rgba(255,255,255,0.4); font-size: 12px; grid-column: 1/-1;'>No courses in holding zone. Add a course from the sidebar or click a course in the matrix to unschedule it.</div>"
 
-    # Inside build_planner_html -> Holding Zone Cards loop:
+    home_campus = st.session_state.get("degree_campus", "")
+
     for code in holding_zone:
         info = lookup_course(code) or catalog_dict.get(code) or {"title": code, "credit_points": "10", "offerings": [], "campuses": [], "prereq_display": "No Prereqs", "group": ""}
         bg = string_to_pastel_hex(code)
@@ -2104,9 +2143,14 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
         cr_text = f" | Co: {', '.join(info['coreqs'])}" if info.get("coreqs") else ""
         offs = format_offerings_label(info.get("offerings", []))
 
-        # Campus badge
-        camp_lbl = format_campuses_label(info.get("campuses", []))
-        camp_badge = f'<span class="badge-pill" style="background: rgba(0, 184, 148, 0.25); border: 1px solid rgba(0, 184, 148, 0.45); color: #55efc4;" title="Campus: {camp_lbl}">📍 {camp_lbl}</span>' if camp_lbl else ''
+        # Campus check against home campus
+        camp_str, is_camp_mismatch = get_campus_badge_data(info.get("campuses", []), home_campus)
+        camp_badge = ""
+        if camp_str:
+            if is_camp_mismatch:
+                camp_badge = f'<span class="badge-pill badge-campus-warn" title="Warning: Not offered at your home campus ({home_campus})">⚠️ 📍 {camp_str}</span>'
+            else:
+                camp_badge = f'<span class="badge-pill badge-campus-ok" title="Offered at: {camp_str}">📍 {camp_str}</span>'
 
         is_core = code in core_set
         core_badge = '<span class="core-tag">CORE</span>' if is_core else ''
@@ -2189,9 +2233,14 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
 
                 offs = format_offerings_label(c_data.get("offerings", []))
                 
-                # Campus badge in matrix
-                camp_lbl = format_campuses_label(c_data.get("campuses", []))
-                camp_badge_matrix = f'<span class="badge-pill" style="background: rgba(0, 184, 148, 0.25); border: 1px solid rgba(0, 184, 148, 0.45); color: #55efc4;" title="Campus: {camp_lbl}">📍 {camp_lbl}</span>' if camp_lbl else ''
+                # Campus badge in matrix (solid + warning if mismatch)
+                camp_str, is_camp_mismatch = get_campus_badge_data(c_data.get("campuses", []), home_campus)
+                camp_badge_matrix = ""
+                if camp_str:
+                    if is_camp_mismatch:
+                        camp_badge_matrix = f'<span class="badge-pill badge-campus-warn" title="Warning: Not offered at your home campus ({home_campus})">⚠️ 📍 {camp_str}</span>'
+                    else:
+                        camp_badge_matrix = f'<span class="badge-pill badge-campus-ok" title="Offered at: {camp_str}">📍 {camp_str}</span>'
 
                 is_core = c in core_set
                 core_badge = '<span class="core-tag">CORE</span>' if is_core else ''
@@ -2334,6 +2383,7 @@ if st.session_state.get("selected_degree"):
         if "sug_page" not in st.session_state:
             st.session_state.sug_page = 1
 
+        home_campus = st.session_state.get("degree_campus", "")
         deg_flex_set = set(st.session_state.get("degree_flex_courses", []))
         core_set = {c["code"] for c in st.session_state.get("degree_core_courses", [])}
         planned_coords = {c: (yr, tr) for (yr, tr), clist in st.session_state.plan.items() for c in clist}
@@ -2346,7 +2396,6 @@ if st.session_state.get("selected_degree"):
         # 1. Degree Recommended Flexible Courses (Placed First)
         for f_code in st.session_state.get("degree_flex_courses", []):
             if f_code not in core_set and f_code not in planned_or_held and f_code not in seen_cand:
-                # Filter out level 6+ (postgrad) courses
                 if get_course_level_num(f_code) >= 6:
                     continue
                 info = lookup_course(f_code) or catalog.get(f_code) or {}
@@ -2359,7 +2408,6 @@ if st.session_state.get("selected_degree"):
         # 2. Universal Course Catalog across all faculties (Excluding Level 6+)
         for c_code, c_info in catalog.items():
             if c_code not in core_set and c_code not in planned_or_held and c_code not in seen_cand:
-                # Filter out Level 6, 7, 8, 9 courses
                 if get_course_level_num(c_code) >= 6:
                     continue
 
@@ -2372,31 +2420,6 @@ if st.session_state.get("selected_degree"):
                 candidates.append(c_copy)
                 seen_cand.add(c_code)
 
-        # Evaluate Whole-Degree Prerequisite Satisfaction & Compatibility
-        candidate_evaluations = []
-        for c in candidates:
-            code = c["code"]
-            is_compat, compat_msg = is_course_degree_compatible(c, sel_deg_code, planned_or_held, catalog)
-            is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(c, st.session_state.plan, planned_coords, sel_deg_code)
-            lvl_lbl = get_course_level_label(code)
-            subj_area = c.get("subject_area") or get_course_subject_area(code)
-            rank_score = term_index(early_term[0], early_term[1]) if early_term else 9999
-
-            is_rec = (code in deg_flex_set) or c.get("is_degree_recommended", False)
-
-            candidate_evaluations.append({
-                "course": c,
-                "is_eligible": is_elig,
-                "is_degree_compat": is_compat,
-                "is_degree_recommended": is_rec,
-                "earliest_term": early_term,
-                "earliest_term_rank": rank_score,
-                "explanation": expl_msg,
-                "missing": missing,
-                "level": lvl_lbl,
-                "subject_area": subj_area
-            })
-
         # --- MULTISELECT CONTROLS & FILTER BAR ---
         col_f1, col_f2, col_f3 = st.columns([1.8, 1.3, 1.4])
         with col_f1:
@@ -2408,7 +2431,6 @@ if st.session_state.get("selected_degree"):
                 key="sug_filter_grps"
             )
         with col_f2:
-            # Undergraduate level options only (Levels 1 to 5)
             level_options = ["Level 1 (1xxx)", "Level 2 (2xxx)", "Level 3 (3xxx)", "Level 4 (4xxx)", "Level 5 (5xxx)"]
             sel_levels = st.multiselect(
                 "Course Level",
@@ -2417,7 +2439,7 @@ if st.session_state.get("selected_degree"):
                 key="sug_filter_lvls"
             )
         with col_f3:
-            all_areas = sorted(list({ce["subject_area"] for ce in candidate_evaluations if ce["subject_area"]}))
+            all_areas = sorted(list({get_course_subject_area(c["code"]) for c in candidates if c.get("code")}))
             sel_areas = st.multiselect(
                 "Area of Study (Subject Code)",
                 options=all_areas,
@@ -2438,28 +2460,21 @@ if st.session_state.get("selected_degree"):
         with col_pp:
             per_page = st.selectbox("Per Page", options=[10, 25, 50], index=0, key="sug_per_page")
 
-        # Apply Filters
+        # --- ACCURATE FILTERING ENGINE (PRE-ENRICHES CANDIDATES BEFORE FILTERING) ---
         filtered_sug = []
         kw = sug_keyword.strip().lower()
 
-        for item in candidate_evaluations:
-            c = item["course"]
+        for c in candidates:
             code = c["code"]
             grp = c.get("group", "Other")
-            lvl = item["level"]
-            area = item["subject_area"]
-            is_eligible = item["is_eligible"]
-            is_compat = item["is_degree_compat"]
+            lvl = get_course_level_label(code)
+            area = c.get("subject_area") or get_course_subject_area(code)
 
             # Filter out Level 6+ courses
             if get_course_level_num(code) >= 6:
                 continue
 
-            # If checked, DO NOT SHOW incompatible degree courses or unsatisfied prereqs
-            if only_prereqs_met:
-                if not is_compat or not is_eligible:
-                    continue
-
+            # Standard facet filtering
             if sel_groups and grp not in sel_groups:
                 continue
             if sel_levels and lvl not in sel_levels:
@@ -2471,7 +2486,38 @@ if st.session_state.get("selected_degree"):
                 if kw not in searchable:
                     continue
 
-            filtered_sug.append(item)
+            # Pre-enrich candidate with live Curriculum API requisites BEFORE checking prerequisites
+            c_full = c
+            if not c.get("from_curriculum_api"):
+                # Lookup live metadata for matching candidate
+                enriched = lookup_course(code)
+                if enriched:
+                    enriched["is_degree_recommended"] = (code in deg_flex_set) or c.get("is_degree_recommended", False)
+                    c_full = enriched
+
+            # Evaluate with live requisites
+            is_compat, compat_msg = is_course_degree_compatible(c_full, sel_deg_code, planned_or_held, catalog)
+            is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(c_full, st.session_state.plan, planned_coords, sel_deg_code)
+            rank_score = term_index(early_term[0], early_term[1]) if early_term else 9999
+            is_rec = (code in deg_flex_set) or c_full.get("is_degree_recommended", False)
+
+            # STRICT PRE-FILTER: Discard any incompatible degree courses or unsatisfied prereqs
+            if only_prereqs_met:
+                if not is_compat or not is_elig:
+                    continue
+
+            filtered_sug.append({
+                "course": c_full,
+                "is_eligible": is_elig,
+                "is_degree_compat": is_compat,
+                "is_degree_recommended": is_rec,
+                "earliest_term": early_term,
+                "earliest_term_rank": rank_score,
+                "explanation": expl_msg,
+                "missing": missing,
+                "level": lvl,
+                "subject_area": area
+            })
 
         # Sort: Recommended electives ALWAYS first, then eligible courses, then by earliest availability
         filtered_sug.sort(key=lambda x: (
@@ -2510,7 +2556,7 @@ if st.session_state.get("selected_degree"):
                         st.session_state.sug_page += 1
                         st.rerun()
 
-            # --- CSS INJECTION FOR MODERN COURSE ROWS, CAMPUS BADGES & RECOMMENDED TAGS ---
+            # --- CSS FOR SOLID, NON-TRANSPARENT CAMPUS AND STATUS BADGES ---
             st.markdown(
                 """
                 <style>
@@ -2528,7 +2574,7 @@ if st.session_state.get("selected_degree"):
                 }
                 .tag-pill {
                     display: inline-block;
-                    padding: 2px 7px;
+                    padding: 2px 8px;
                     border-radius: 4px;
                     font-size: 10px;
                     font-weight: 700;
@@ -2537,12 +2583,27 @@ if st.session_state.get("selected_degree"):
                 .tag-area { background: rgba(112, 161, 255, 0.18); color: #70a1ff; border: 1px solid rgba(112, 161, 255, 0.35); }
                 .tag-level { background: rgba(165, 94, 234, 0.18); color: #a55eea; border: 1px solid rgba(165, 94, 234, 0.35); }
                 .tag-off { background: rgba(255, 165, 2, 0.18); color: #ffa502; border: 1px solid rgba(255, 165, 2, 0.35); }
-                .tag-campus { background: rgba(0, 184, 148, 0.18); color: #00cec9; border: 1px solid rgba(0, 206, 201, 0.35); }
+                
+                /* 100% Solid, Non-Transparent Campus Badges */
+                .tag-campus { 
+                    background: #00564d !important; 
+                    color: #ffffff !important; 
+                    border: 1.5px solid #00b894 !important; 
+                    opacity: 1 !important;
+                }
+                .tag-campus-warn { 
+                    background: #8b0000 !important; 
+                    color: #ffffff !important; 
+                    border: 1.5px solid #ff4d4d !important; 
+                    opacity: 1 !important;
+                    box-shadow: 0 0 6px rgba(255, 77, 77, 0.6) !important;
+                }
+
                 .tag-cp { background: rgba(255, 255, 255, 0.1); color: #f1f2f6; }
                 .tag-rec { 
                     background: rgba(255, 215, 0, 0.25) !important; 
                     color: #ffd700 !important; 
-                    border: 1px solid #ffd700 !important;
+                    border: 1px solid #ffd700 !important; 
                     font-weight: 800 !important;
                     letter-spacing: 0.5px !important;
                 }
@@ -2554,22 +2615,12 @@ if st.session_state.get("selected_degree"):
             )
 
             for item in page_items:
-                c_code = item["course"]["code"]
-                was_rec = item["is_degree_recommended"]
-
-                # Enrich with Curriculum API data if not already fetched
-                if not item["course"].get("from_curriculum_api"):
-                    enriched = lookup_course(c_code)
-                    if enriched:
-                        enriched["is_degree_recommended"] = was_rec
-                        item["course"] = enriched
-                        is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(
-                            enriched, st.session_state.plan, planned_coords, sel_deg_code
-                        )
-                        item["is_eligible"] = is_elig
-                        item["explanation"] = expl_msg
+                # Secondary Guard: Skip any items with unsatisfied requisites if filter is active
+                if only_prereqs_met and (not item["is_degree_compat"] or not item["is_eligible"]):
+                    continue
 
                 c_info = item["course"]
+                c_code = c_info["code"]
                 title = c_info["title"]
                 cp = c_info.get("credit_points", "10")
                 offs = format_offerings_label(c_info.get("offerings", []))
@@ -2577,9 +2628,14 @@ if st.session_state.get("selected_degree"):
                 lvl_tag = item["level"].split(" ")[0] + " " + item["level"].split(" ")[1]
                 expl = item["explanation"]
 
-                # Campus label
-                camp_lbl = format_campuses_label(c_info.get("campuses", []))
-                camp_tag_html = f'<span class="tag-pill tag-campus">📍 {camp_lbl}</span>' if camp_lbl else ''
+                # Campus label with home campus comparison
+                camp_str, is_camp_mismatch = get_campus_badge_data(c_info.get("campuses", []), home_campus)
+                camp_tag_html = ""
+                if camp_str:
+                    if is_camp_mismatch:
+                        camp_tag_html = f'<span class="tag-pill tag-campus-warn" title="Warning: Not offered at your home campus ({home_campus})">⚠️ 📍 {camp_str}</span>'
+                    else:
+                        camp_tag_html = f'<span class="tag-pill tag-campus" title="Offered at: {camp_str}">📍 {camp_str}</span>'
 
                 status_class = "status-ready" if item["is_eligible"] else "status-pending"
                 rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if item["is_degree_recommended"] else ''
