@@ -143,27 +143,27 @@ def extract_course_codes(text: str):
 
 def extract_program_restrictions(desc: str, mapped_components: dict = None) -> list:
     """
-    Extracts 4-digit program/degree code restrictions from text, requisites, 
-    and curriculum API mapped components (e.g. 1613 for Dental Hygiene).
+    Generalized program restriction extractor.
+    Extracts 4-digit degree codes from API requirement groups, link tags, and descriptions.
     """
     restricted = []
 
-    # 1. Parse structured mappedData components if available
+    # 1. Inspect structured mappedData components (e.g. crseOfrgRqmntGrp -> Prog: 1613)
     if mapped_components and isinstance(mapped_components, dict):
         for comp_key, comp_val in mapped_components.items():
             comp_key_lower = comp_key.lower()
             
-            # Check enrolment requirement groups (e.g. crseOfrgRqmntGrp, crseOfrgRqmntGrpGc)
+            # Enrolment requirement groups (Prog: XXXX)
             if "rqmntgrp" in comp_key_lower:
                 val_obj = comp_val.get("value", {})
                 if isinstance(val_obj, dict):
                     combined_str = f"{val_obj.get('value', '')} {val_obj.get('description', '')}"
                     for m in re.finditer(r'(?:prog(?:ram)?[:\s]+)?\b([0-9]{4})\b', combined_str, re.I):
                         c = m.group(1)
-                        if c not in restricted and not (c.startswith("20") and int(c) >= 2020):
+                        # Exclude calendar years (2020-2035)
+                        if c not in restricted and not (c.startswith("20") and 2020 <= int(c) <= 2035):
                             restricted.append(c)
 
-                    # Check nested table rows
                     for row in val_obj.get("rows", []):
                         if isinstance(row, dict):
                             for cell in row.values():
@@ -171,10 +171,10 @@ def extract_program_restrictions(desc: str, mapped_components: dict = None) -> l
                                     cell_str = f"{cell.get('value', '')} {cell.get('description', '')}"
                                     for m in re.finditer(r'(?:prog(?:ram)?[:\s]+)?\b([0-9]{4})\b', cell_str, re.I):
                                         c = m.group(1)
-                                        if c not in restricted and not (c.startswith("20") and int(c) >= 2020):
+                                        if c not in restricted and not (c.startswith("20") and 2020 <= int(c) <= 2035):
                                             restricted.append(c)
 
-            # Check program link tags like <linked-co data-code='1613' />
+            # Program link tags (data-code='XXXX')
             if "pstn" in comp_key_lower or "requiste" in comp_key_lower:
                 val_str = str(comp_val.get("value", ""))
                 for m in re.finditer(r'data-code=[\'"]([0-9]{4})[\'"]', val_str, re.I):
@@ -185,30 +185,24 @@ def extract_program_restrictions(desc: str, mapped_components: dict = None) -> l
     if not desc:
         return restricted
 
-    # 2. Text patterns that allow degree titles between 'enrolled in' and the code
+    # 2. Generalized text pattern matching
     patterns = [
-        # Matches: "must be enrolled in Bachelor of Dental Hygiene 1613"
         r'must be enrolled in\s+[^.;\n\d]*\b([0-9]{4})\b',
-        # Matches: "must be undertaking Bachelor of Medical Science 1280"
         r'must be undertaking\s+[^.;\n\d]*\b([0-9]{4})\b',
-        # Matches: "Restrictions: must be enrolled in ... 1613"
         r'restrictions?:\s*[^.;\n\d]*\b([0-9]{4})\b',
-        # Matches: "restricted to students in ... 1613"
         r'restricted to\s+[^.;\n\d]*\b([0-9]{4})\b',
-        # Matches: "Prog: 1613" or "Program: 1613"
         r'\b(?:prog(?:ram)?)\s*[:#]?\s*([0-9]{4})\b',
-        # Matches: data-code="1613"
         r'data-code=[\'"]([0-9]{4})[\'"]'
     ]
 
     for pat in patterns:
         for match in re.finditer(pat, desc, re.I):
             c = match.group(1)
-            # Avoid matching years like 2024, 2025, 2026, 2027
-            if c not in restricted and not (c.startswith("20") and int(c) >= 2020):
+            if c not in restricted and not (c.startswith("20") and 2020 <= int(c) <= 2035):
                 restricted.append(c)
 
     return restricted
+
 
 def extract_cp_prereq(rule_def: str = "", rule_sum: str = "", desc: str = "") -> int:
     """Extracts minimum prior credit points required (e.g. 80 CP in 3002LFC)."""
@@ -555,21 +549,26 @@ def lookup_course(clean_code: str, selected_year: int = None):
     if selected_year is None:
         selected_year = datetime.now().year
 
+    clean_code = str(clean_code).replace(" ", "").upper().strip()
     catalog_entry = catalog.get(clean_code, {})
-    
-    # If already verified via Curriculum API, return immediately
+
+    # If already verified via Curriculum API, return immediately from memory
     if catalog_entry.get("from_curriculum_api"):
         return catalog_entry
 
     offerings = catalog_entry.get("offerings", [])
+    print(f"[COURSE LOOKUP] Fetching live requisites for {clean_code} from Curriculum API...", flush=True)
     curriculum_meta = fetch_course_from_curriculum_api(clean_code, selected_year, offerings)
+    
     if curriculum_meta:
+        print(f"[COURSE LOOKUP] ✅ {clean_code}: Pre='{curriculum_meta['prereq_display']}', Co={curriculum_meta['coreqs']}, Anti={curriculum_meta['incompatibles']}, Prog={curriculum_meta['program_restrictions']}", flush=True)
         catalog[clean_code] = curriculum_meta
         return curriculum_meta
 
     if catalog_entry:
         return catalog_entry
     return None
+
 
 catalog = load_full_catalog()
 
@@ -1183,23 +1182,33 @@ def validate_plan(plan: dict, catalog_dict: dict):
             placed_coords[c] = (yr, tr)
 
     all_planned = set(placed_coords.keys())
+    all_planned_or_held = all_planned | set(st.session_state.get("holding_zone", []))
+    sel_deg_code = st.session_state.get("selected_degree", {}).get("code") if st.session_state.get("selected_degree") else None
+
+    print(f"\n[VALIDATE PLAN] Validating {len(all_planned)} scheduled courses against plan...", flush=True)
 
     for (yr, tr), courses in plan.items():
         current_rank = term_index(yr, tr)
         for c in courses:
             c_warns = []
             c_sats = []
-            info = catalog_dict.get(c) or lookup_course(c) or {}
+
+            # FORCE live lookup so real requisites from Curriculum API are verified
+            info = lookup_course(c) or catalog_dict.get(c) or {}
             prereq_groups = info.get("prereq_groups", [])
             coreqs = info.get("coreqs", [])
-            incomps = info.get("incompatibles", [])
             min_cp = info.get("min_cp_prereq", 0)
 
-            # 1. Offering Check
+            # 1. Program restriction check
+            prog_restr = [str(x).strip() for x in info.get("program_restrictions", []) if str(x).strip()]
+            if prog_restr and sel_deg_code and str(sel_deg_code).strip() not in prog_restr:
+                c_warns.append(f"Restricted to program(s): {', '.join(prog_restr)}")
+
+            # 2. Offering Check
             if not is_course_offered_in_term(info, tr):
                 c_warns.append(f"Not usually offered in Trimester {tr}")
 
-            # 2. Minimum Prior Credit Points Check (e.g. 80 CP for 3002LFC)
+            # 3. Minimum Prior Credit Points Check
             if min_cp > 0:
                 prior_cp = sum(
                     int((catalog_dict.get(pc) or lookup_course(pc) or {}).get("credit_points", 10) or 10)
@@ -1212,7 +1221,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
                 else:
                     c_sats.append(f"Credit point requirement satisfied: {prior_cp}/{min_cp} CP completed prior")
 
-            # 3. Course Prerequisites Check
+            # 4. Course Prerequisites Check (AND/OR groups)
             for group in prereq_groups:
                 g_courses = group.get("courses", [])
                 count_needed = group.get("count", 1)
@@ -1243,7 +1252,7 @@ def validate_plan(plan: dict, catalog_dict: dict):
                     else:
                         c_warns.append(f"Missing Prerequisite: Complete at least {count_needed} of ({' OR '.join(g_courses)})")
 
-            # 4. Corequisites Check
+            # 5. Corequisites Check
             for cr in coreqs:
                 if cr not in placed_coords:
                     c_warns.append(f"Missing Corequisite: {cr}")
@@ -1254,53 +1263,70 @@ def validate_plan(plan: dict, catalog_dict: dict):
                     else:
                         c_warns.append(f"Coreq {cr} scheduled after Y{yr} T{tr}")
 
-            # 5. Incompatibilities Check
-            for inc in incomps:
-                if inc in all_planned and inc != c:
-                    c_warns.append(f"Incompatible with {inc}")
+            # 6. Bidirectional Incompatibility Check
+            incomp_issues = check_course_incompatibilities(info, all_planned_or_held, catalog_dict)
+            for iss in incomp_issues:
+                c_warns.append(iss)
 
             if c_warns:
                 warnings[c] = c_warns
+                print(f"[VALIDATE PLAN] ⚠️ {c} in Y{yr} T{tr} -> Warnings: {c_warns}", flush=True)
             if c_sats:
                 satisfied[c] = c_sats
 
     return warnings, satisfied
 
-# Discipline-level restrictions for restricted clinical programs
-CLINICAL_DISCIPLINE_RESTRICTIONS = {
-    "DOH": ["1613"],          # Dental Hygiene only
-    "DEN": ["1577", "5703"],  # Dentistry only
-    "MID": ["1354"],          # Midwifery only
-}
+def check_course_incompatibilities(c_info: dict, all_planned_or_held: set, catalog_dict: dict) -> list:
+    """
+    Bidirectional incompatibility check:
+    1. Does c_info list any scheduled/held course as incompatible (e.g. 2003MSC)?
+    2. Does any scheduled/held course list c_info as incompatible?
+    """
+    code = c_info.get("code")
+    incomp_issues = []
 
-def is_course_degree_compatible(c_info: dict, sel_deg_code: str, planned_coords: dict) -> tuple[bool, str]:
-    """Returns (False, reason) if the course is restricted to another degree or incompatible."""
+    # Forward check
+    for inc in c_info.get("incompatibles", []):
+        if inc in all_planned_or_held and inc != code:
+            incomp_issues.append(f"Incompatible with {inc}")
+
+    # Reverse check
+    for planned_c in all_planned_or_held:
+        if planned_c == code:
+            continue
+        p_info = catalog_dict.get(planned_c) or {}
+        if code in p_info.get("incompatibles", []):
+            msg = f"Incompatible with {planned_c}"
+            if msg not in incomp_issues:
+                incomp_issues.append(msg)
+
+    return incomp_issues
+
+
+def is_course_degree_compatible(c_info: dict, sel_deg_code: str, all_planned_or_held: set, catalog_dict: dict) -> tuple[bool, str]:
+    """Fully generalized check: degree program restrictions and bidirectional anti-requisites."""
     code = c_info.get("code", "")
-    subj = c_info.get("subject_area") or get_course_subject_area(code)
 
-    # 1. Clinical Subject Area Restriction
-    if sel_deg_code and subj in CLINICAL_DISCIPLINE_RESTRICTIONS:
-        allowed = CLINICAL_DISCIPLINE_RESTRICTIONS[subj]
-        if str(sel_deg_code).strip() not in allowed:
-            return False, f"🚫 Restricted: {subj} courses are restricted to program(s): {', '.join(allowed)}"
-
-    # 2. Specific Program Restrictions from API
+    # 1. Program restriction check (e.g. 1000DOH restricted to 1613)
     prog_restr = [str(x).strip() for x in c_info.get("program_restrictions", []) if str(x).strip()]
     if prog_restr and sel_deg_code:
-        if str(sel_deg_code).strip() not in prog_restr:
-            return False, f"🚫 Restricted: Only open to students in program(s): {', '.join(prog_restr)}"
+        deg_clean = str(sel_deg_code).strip()
+        if deg_clean not in prog_restr:
+            return False, f"Restricted: Only open to students in program(s): {', '.join(prog_restr)}"
 
-    # 3. Incompatibles / Anti-requisites in current plan
-    for inc in c_info.get("incompatibles", []):
-        if inc in planned_coords:
-            pyr, ptr = planned_coords[inc]
-            return False, f"🚫 Incompatible with {inc} (scheduled in plan Y{pyr} T{ptr})"
+    # 2. Incompatibility / Anti-requisite check (e.g. 2003MSC)
+    incomp_issues = check_course_incompatibilities(c_info, all_planned_or_held, catalog_dict)
+    if incomp_issues:
+        return False, f"🚫 {incomp_issues[0]} (already in your plan/holding zone)"
 
     return True, ""
 
 def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
-    # 1. Degree compatibility & Anti-requisites Check
-    is_compat, compat_msg = is_course_degree_compatible(c_info, selected_degree_code, planned_coords)
+    code = c_info.get("code")
+    all_planned_or_held = set(planned_coords.keys()) | set(st.session_state.get("holding_zone", []))
+
+    # 1. Generalized compatibility & anti-requisite check
+    is_compat, compat_msg = is_course_degree_compatible(c_info, selected_degree_code, all_planned_or_held, catalog)
     if not is_compat:
         return False, None, compat_msg, []
 
@@ -1319,7 +1345,7 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         term_courses = plan[t]
         running_cp += sum(int((catalog.get(tc) or {}).get("credit_points", 10) or 10) for tc in term_courses)
 
-    # 4. Minimum CP Prerequisite Check (e.g. 80 CP)
+    # 4. Minimum CP Prerequisite Check
     min_cp = c_info.get("min_cp_prereq", 0)
     latest_term_cp = 0
     cp_sat_msg = ""
@@ -1334,7 +1360,7 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         latest_term_cp = term_index(eligible_term_for_cp[0], eligible_term_for_cp[1]) - 1
         cp_sat_msg = f"{min_cp} CP completed"
 
-    # 5. Course Prerequisites Check
+    # 5. Course Prerequisites Check (AND/OR Groups)
     p_groups = c_info.get("prereq_groups", [])
     latest_term_courses = 0
     missing_groups = []
@@ -1584,20 +1610,17 @@ with st.sidebar:
             c_info = lookup_course(clean_code, planned_year)
 
             if c_info:
-                # 1. Program Compatibility Check
+                # 1. Program & Incompatibility Validation
                 sel_deg = st.session_state.get("selected_degree")
-                planned_coords = {c: (yr, tr) for (yr, tr), clist in st.session_state.plan.items() for c in clist}
-                
-                is_compat = True
-                compat_msg = ""
-                if sel_deg:
-                    sel_deg_code = str(sel_deg.get("code", "")).strip()
-                    is_compat, compat_msg = is_course_degree_compatible(c_info, sel_deg_code, planned_coords)
+                sel_deg_code = str(sel_deg.get("code", "")).strip() if sel_deg else None
+                all_planned_or_held = set(c for clist in st.session_state.plan.values() for c in clist) | set(st.session_state.holding_zone)
+
+                is_compat, compat_msg = is_course_degree_compatible(c_info, sel_deg_code, all_planned_or_held, catalog)
 
                 if not is_compat:
                     st.session_state.feedback_message = (
-                        "error", 
-                        f"❌ Cannot add **{clean_code}** ({c_info['title']}): {compat_msg}. You are currently planning **{sel_deg['title']} ({sel_deg_code})**."
+                        "error",
+                        f"❌ Cannot add **{clean_code}** ({c_info['title']}): {compat_msg}."
                     )
                 else:
                     already_in_holding = clean_code in st.session_state.holding_zone
@@ -2004,11 +2027,10 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
 
     # Inside build_planner_html -> Holding Zone Cards loop:
     for code in holding_zone:
-        info = catalog_dict.get(code) or lookup_course(code) or {"title": code, "credit_points": "10", "offerings": [], "prereq_display": "No Prereqs", "group": ""}
+        info = lookup_course(code) or catalog_dict.get(code) or {"title": code, "credit_points": "10", "offerings": [], "prereq_display": "No Prereqs", "group": ""}
         bg = string_to_pastel_hex(code)
         is_sel = "is-selected" if code == selected_code else ""
 
-        # Displays prerequisites, corequisites, and AND/OR rule groups
         pr_display = info.get('prereq_display', 'No Prereqs')
         pr_text = f"Pre: {pr_display}"
         cr_text = f" | Co: {', '.join(info['coreqs'])}" if info.get("coreqs") else ""
