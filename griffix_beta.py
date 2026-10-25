@@ -454,20 +454,10 @@ def load_full_catalog():
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalog_offerings: list):
     subscription_key = "b8ae10d400ef42f89a127abe4a760e46"
-    offs_lower = [str(o).lower() for o in catalog_offerings]
-    if any("trimester 1" in o or "t1" in o for o in offs_lower):
-        primary_term = "3261"
-    elif any("trimester 2" in o or "t2" in o for o in offs_lower):
-        primary_term = "3265"
-    elif any("summer" in o or "trimester 3" in o or "t3" in o for o in offs_lower):
-        primary_term = "3268"
-    else:
-        primary_term = "3261"
-
-    terms_to_try = [primary_term] + [t for t in ["3261", "3265", "3268"] if t != primary_term]
-    current_year = datetime.now().year
-    search_year = min(selected_year, current_year)
-    years_to_try = [search_year, search_year - 1]
+    
+    # Priority order for years (ensure 2026/2027 are tried for current catalog)
+    years_to_try = [selected_year, 2026, 2027, 2025]
+    years_to_try = list(dict.fromkeys([y for y in years_to_try if y]))
 
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -477,16 +467,21 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
     }
 
     for yr in years_to_try:
+        yr_short = str(yr)[-2:]
+        # PeopleSoft term codes: T1 -> 3{yy}1, T2 -> 3{yy}5, T3 -> 3{yy}8
+        terms_to_try = [f"3{yr_short}1", f"3{yr_short}5", f"3{yr_short}8"]
+
         for term_code in terms_to_try:
             url = f"https://api-lt.griffith.edu.au/curriculumapi/v1/course/{clean_code}/{yr}/{term_code}?subscription-key={subscription_key}"
             try:
-                resp = requests.get(url, headers=headers, timeout=10)
+                resp = requests.get(url, headers=headers, timeout=8)
                 if resp.status_code == 200:
                     data = resp.json()
                     mapped = data.get("mappedData", {}).get("components", {})
 
                     prereq_groups, coreqs, incompatibles = [], [], []
                     min_cp = 0
+
                     req_obj = mapped.get("crseRequiste", {}).get("value", {})
                     if isinstance(req_obj, dict):
                         for r in req_obj.get("requisites", []):
@@ -500,13 +495,10 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
                             if "PRE" in rtype:
                                 groups = parse_rule_definition_to_groups(rule_def, rule_sum)
-                                clean_groups = []
                                 for g in groups:
                                     filtered_codes = [c for c in g.get("courses", []) if c != clean_code]
                                     if filtered_codes:
-                                        clean_groups.append({"count": min(g.get("count", 1), len(filtered_codes)), "courses": filtered_codes})
-                                if clean_groups:
-                                    prereq_groups.extend(clean_groups)
+                                        prereq_groups.append({"count": min(g.get("count", 1), len(filtered_codes)), "courses": filtered_codes})
                             elif "CO" in rtype:
                                 coreqs.extend([c for c in extract_course_codes(f"{rule_def} {rule_sum}") if c != clean_code])
                             elif "ANTI" in rtype or "INCOMPATIBLE" in rtype:
@@ -525,7 +517,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     if incomp_match:
                         incompatibles.extend([c for c in extract_course_codes(incomp_match.group(1)) if c != clean_code])
 
-                    # Pass both the text and the mapped components
+                    # Extract program restrictions from both text and mapped components (e.g. 1613 from crseOfrgRqmntGrp)
                     prog_restrictions = extract_program_restrictions(combined_req_text, mapped_components=mapped)
 
                     final_offerings = list(catalog_offerings)
@@ -538,7 +530,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     cp_val = mapped.get("crseAwrdCrdtPnts", {}).get("value", {})
                     cp = str(cp_val.get("value", 10) if isinstance(cp_val, dict) else data.get("unitsMinimum", 10))
 
-                    return {
+                    result_meta = {
                         "code": clean_code,
                         "title": title,
                         "credit_points": cp,
@@ -552,10 +544,11 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                         "min_cp_prereq": min_cp,
                         "coreqs": list(dict.fromkeys(coreqs)),
                         "incompatibles": list(dict.fromkeys(incompatibles)),
-                        "program_restrictions": prog_restrictions
+                        "program_restrictions": prog_restrictions,
+                        "from_curriculum_api": True
                     }
-            except Exception as e:
-                print(f"[CURRICULUM API] Failed for {clean_code} ({yr}/{term_code}): {e}", flush=True)
+                    return result_meta
+            except Exception:
                 continue
 
     return None
@@ -1270,18 +1263,24 @@ def validate_plan(plan: dict, catalog_dict: dict):
 
     return warnings, satisfied
 
-def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
-    """
-    Checks if an elective can be taken:
-    1. Checks program restrictions (e.g. 1000DOH restricted to 1613).
-    2. Checks incompatibility with scheduled courses.
-    3. Checks corequisites (e.g. 1000DOH requires 1036DOH).
-    4. Checks minimum prior CP (e.g. 80 CP).
-    5. Checks prerequisite completion.
-    """
-    code = c_info.get("code")
+# Discipline-level restrictions for restricted clinical programs
+CLINICAL_DISCIPLINE_RESTRICTIONS = {
+    "DOH": ["1613"],          # Dental Hygiene only
+    "DEN": ["1577", "5703"],  # Dentistry only
+    "MID": ["1354"],          # Midwifery only
+}
 
-    # 1. Program / Degree Restriction
+def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
+    code = c_info.get("code")
+    subj_area = c_info.get("subject_area") or get_course_subject_area(code)
+
+    # 1. Subject Area / Clinical Discipline Restriction
+    if selected_degree_code and subj_area in CLINICAL_DISCIPLINE_RESTRICTIONS:
+        allowed_progs = CLINICAL_DISCIPLINE_RESTRICTIONS[subj_area]
+        if str(selected_degree_code).strip() not in allowed_progs:
+            return False, None, f"🚫 Restricted: {subj_area} courses are restricted to program(s): {', '.join(allowed_progs)}", []
+
+    # 2. Specific Program / Degree Restriction from API
     prog_restr = c_info.get("program_restrictions", [])
     if prog_restr and selected_degree_code:
         deg_code_clean = str(selected_degree_code).strip()
@@ -1289,21 +1288,20 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         if deg_code_clean not in restr_clean:
             return False, None, f"🚫 Restricted: Only open to students in program(s): {', '.join(restr_clean)}", []
 
-    # 2. Incompatibility / Anti-requisites
+    # 3. Incompatibility / Anti-requisites Check
     incomps = c_info.get("incompatibles", [])
     for inc in incomps:
         if inc in planned_coords:
             pyr, ptr = planned_coords[inc]
             return False, None, f"🚫 Incompatible with {inc} (scheduled in plan Y{pyr} T{ptr})", []
 
-    # 3. Corequisites Check (Must be scheduled in or before the term)
+    # 4. Mandatory Co-requisites Check
     coreqs = c_info.get("coreqs", [])
-    missing_coreqs = []
-    for cr in coreqs:
-        if cr not in planned_coords:
-            missing_coreqs.append(cr)
-    
-    # 4. Calculate cumulative CP progression by term
+    missing_coreqs = [cr for cr in coreqs if cr not in planned_coords]
+    if missing_coreqs:
+        return False, None, f"⚠️ Requires co-enrolment in: {', '.join(missing_coreqs)}", []
+
+    # 5. Cumulative CP Check
     sorted_terms = sorted(plan.keys(), key=lambda t: term_index(t[0], t[1]))
     cum_cp_before_term = {}
     running_cp = 0
@@ -1312,7 +1310,6 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         term_courses = plan[t]
         running_cp += sum(int((catalog.get(tc) or {}).get("credit_points", 10) or 10) for tc in term_courses)
 
-    # 5. CP Prerequisite Check
     min_cp = c_info.get("min_cp_prereq", 0)
     latest_term_cp = 0
     cp_sat_msg = ""
@@ -1354,11 +1351,6 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         missing_str = format_prereq_display(missing_groups)
         return False, None, f"Prerequisites needed: {missing_str}", missing_groups
 
-    # If prerequisites are met but mandatory corequisites are missing from the plan:
-    if missing_coreqs:
-        return False, None, f"Requires co-enrolment in: {', '.join(missing_coreqs)}", []
-
-    # Calculate earliest availability
     overall_latest_rank = max(latest_term_courses, latest_term_cp)
     ready_yr, ready_tr = term_from_index(overall_latest_rank + 1) if overall_latest_rank > 0 else (1, 1)
 
@@ -2418,9 +2410,24 @@ if st.session_state.get("selected_degree"):
                 unsafe_allow_html=True
             )
 
+            # Live-enrich items on the current page with full Curriculum API requisites
             for item in page_items:
+                c_code = item["course"]["code"]
+                # If course only has stub data, fetch full details from Curriculum API
+                if not item["course"].get("from_curriculum_api"):
+                    enriched = lookup_course(c_code)
+                    if enriched:
+                        item["course"] = enriched
+                        # Re-evaluate with full Curriculum API requisites
+                        is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(
+                            enriched, st.session_state.plan, planned_coords, sel_deg_code
+                        )
+                        item["is_eligible"] = is_elig
+                        item["earliest_term"] = early_term
+                        item["explanation"] = expl_msg
+                        item["missing"] = missing
+
                 c_info = item["course"]
-                c_code = c_info["code"]
                 title = c_info["title"]
                 cp = c_info.get("credit_points", "10")
                 offs = format_offerings_label(c_info.get("offerings", []))
@@ -2459,7 +2466,8 @@ if st.session_state.get("selected_degree"):
                         )
                     with c_btn:
                         st.write("")
-                        if st.button("➕ Add", key=f"add_sug_{c_code}", use_container_width=True, help=f"Add {c_code} to Course Holding Zone"):
+                        btn_disabled = not item["is_eligible"]
+                        if st.button("➕ Add", key=f"add_sug_{c_code}", disabled=btn_disabled, use_container_width=True, help=f"Add {c_code} to Course Holding Zone"):
                             if c_code not in st.session_state.holding_zone:
                                 st.session_state.holding_zone.append(c_code)
                             st.rerun()
