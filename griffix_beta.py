@@ -1268,7 +1268,7 @@ if bridge_input:
 # 9. SIDEBAR: DEGREE SELECTION, COURSE SEARCH & STRUCTURE
 # -----------------------------------------------------------------------------
 with st.sidebar:
-    if st.session_state.selected_degree is None or st.session_state.degree_edit_mode:
+    if st.session_state.get("selected_degree") is None or st.session_state.get("degree_edit_mode", False):
         with st.expander("🎓 Select a Degree Program", expanded=True):
             st.write("Search your degree to auto-load its structure and prescribed study plan:")
             deg_query = st.text_input("Degree Keyword", placeholder="e.g. Medical Science, Nursing, Business...", key="degree_search_input")
