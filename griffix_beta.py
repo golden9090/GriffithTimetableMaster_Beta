@@ -2926,24 +2926,24 @@ if st.session_state.get("selected_degree"):
                     with c_main:
                         st.markdown(
                             f"""
-                            <div class="sug-card">
-                                <div style="display:flex; justify-content:space-between; align-items:center;">
-                                    <span style="font-size:13.5px; font-weight:700;">
-                                        {c_code} — {title} {rec_badge}
-                                    </span>
-                                </div>
-                                <div style="margin-top:6px; margin-bottom:4px;">
-                                    <span class="tag-pill tag-area">{area_tag}</span>
-                                    <span class="tag-pill tag-level">{lvl_tag}</span>
-                                    <span class="tag-pill tag-cp">{cp} CP</span>
-                                    <span class="tag-pill tag-off">Offerings: {offs}</span>
-                                    {camp_tag_html}
-                                    <span class="tag-pill" style="background:rgba(255,255,255,0.06); color:#a4b0be;">{c_info.get('group', 'General')}</span>
-                                </div>
-                                <div class="{status_class}">
-                                    {expl}
-                                </div>
-                            </div>
+<div class="sug-card">
+<div style="display:flex; justify-content:space-between; align-items:center;">
+<span style="font-size:13.5px; font-weight:700;">
+{c_code} — {title} {rec_badge}
+</span>
+</div>
+<div style="margin-top:6px; margin-bottom:4px;">
+<span class="tag-pill tag-area">{area_tag}</span>
+<span class="tag-pill tag-level">{lvl_tag}</span>
+<span class="tag-pill tag-cp">{cp} CP</span>
+<span class="tag-pill tag-off">Offerings: {offs}</span>
+{camp_tag_html}
+<span class="tag-pill" style="background:rgba(255,255,255,0.06); color:#a4b0be;">{c_info.get('group', 'General')}</span>
+</div>
+<div class="{status_class}">
+{expl}
+</div>
+</div>
                             """,
                             unsafe_allow_html=True
                         )
