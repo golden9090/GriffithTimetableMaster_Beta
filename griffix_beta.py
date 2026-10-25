@@ -2841,21 +2841,39 @@ if st.session_state.get("selected_degree"):
                         st.session_state.sug_page += 1
                         st.rerun()
 
+            # --- CSS FOR PERFECT ROW ALIGNMENT, NO TRUNCATION & SOLID BADGES ---
             st.markdown(
                 """
                 <style>
+                /* Align the card and button horizontally and center them vertically */
+                div[data-testid="stHorizontalBlock"]:has(.sug-card) {
+                    align-items: center !important;
+                    margin-bottom: 9px !important;
+                }
+                div[data-testid="stHorizontalBlock"]:has(.sug-card) > div {
+                    display: flex !important;
+                    align-items: center !important;
+                }
+                div[data-testid="stHorizontalBlock"]:has(.sug-card) button {
+                    margin: 0 !important;
+                    white-space: nowrap !important;
+                    min-height: 42px !important;
+                }
+
                 .sug-card {
+                    width: 100%;
                     background: rgba(255, 255, 255, 0.02);
                     border: 1px solid rgba(255, 255, 255, 0.1);
                     border-radius: 8px;
                     padding: 12px 16px;
-                    margin-bottom: 9px;
+                    margin-bottom: 0 !important;
                     transition: border-color 0.2s ease, background 0.2s ease;
                 }
                 .sug-card:hover {
                     border-color: rgba(112, 161, 255, 0.6);
                     background: rgba(255, 255, 255, 0.05);
                 }
+
                 .tags-row {
                     display: flex;
                     align-items: center;
@@ -2865,18 +2883,19 @@ if st.session_state.get("selected_degree"):
                     white-space: nowrap;
                     margin-top: 6px;
                     margin-bottom: 6px;
-                    scrollbar-width: none; /* Firefox */
-                    -ms-overflow-style: none; /* IE/Edge */
+                    scrollbar-width: none;
+                    -ms-overflow-style: none;
                 }
                 .tags-row::-webkit-scrollbar {
-                    display: none; /* Chrome, Safari, Opera */
+                    display: none;
                 }
+
                 .tag-pill {
                     display: inline-flex;
                     align-items: center;
                     white-space: nowrap;
                     flex-shrink: 0;
-                    padding: 2px 7px;
+                    padding: 2px 8px;
                     border-radius: 4px;
                     font-size: 10px;
                     font-weight: 700;
@@ -2919,6 +2938,9 @@ if st.session_state.get("selected_degree"):
             )
 
             for item in page_items:
+                if only_prereqs_met and (not item["is_degree_compat"] or not item["is_eligible"]):
+                    continue
+
                 c_info = item["course"]
                 c_code = c_info["code"]
                 title = c_info["title"]
@@ -2928,6 +2950,7 @@ if st.session_state.get("selected_degree"):
                 lvl_tag = item["level"].split(" ")[0] + " " + item["level"].split(" ")[1]
                 expl = item["explanation"]
 
+                # Campus label with home campus comparison
                 camp_str, is_camp_mismatch = get_campus_badge_data(c_info.get("campuses", []), home_campus)
                 camp_tag_html = ""
                 if camp_str:
@@ -2944,7 +2967,12 @@ if st.session_state.get("selected_degree"):
                 rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if item["is_degree_recommended"] else ''
 
                 with st.container():
-                    c_main, c_btn = st.columns([5.4, 0.6])
+                    # 4.85 : 1.15 gives plenty of room for '➕ Add' without truncation
+                    try:
+                        c_main, c_btn = st.columns([4.85, 1.15], vertical_alignment="center")
+                    except TypeError:
+                        c_main, c_btn = st.columns([4.85, 1.15])
+
                     with c_main:
                         st.markdown(
                             f"""
@@ -2970,7 +2998,6 @@ if st.session_state.get("selected_degree"):
                             unsafe_allow_html=True
                         )
                     with c_btn:
-                        st.write("")
                         btn_disabled = not item["is_eligible"]
                         if st.button("➕ Add", key=f"add_sug_{c_code}", disabled=btn_disabled, use_container_width=True, help=f"Add {c_code} to Course Holding Zone"):
                             if c_code not in st.session_state.holding_zone:
