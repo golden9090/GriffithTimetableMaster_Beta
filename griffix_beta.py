@@ -455,7 +455,7 @@ def load_full_catalog():
 def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalog_offerings: list):
     subscription_key = "b8ae10d400ef42f89a127abe4a760e46"
     
-    # Priority order for years (ensure 2026/2027 are tried for current catalog)
+    # Try the selected year, then 2026, 2027, 2025
     years_to_try = [selected_year, 2026, 2027, 2025]
     years_to_try = list(dict.fromkeys([y for y in years_to_try if y]))
 
@@ -468,7 +468,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
 
     for yr in years_to_try:
         yr_short = str(yr)[-2:]
-        # PeopleSoft term codes: T1 -> 3{yy}1, T2 -> 3{yy}5, T3 -> 3{yy}8
+        # Correct PeopleSoft term codes for the specific year: T1=3{yy}1, T2=3{yy}5, T3=3{yy}8
         terms_to_try = [f"3{yr_short}1", f"3{yr_short}5", f"3{yr_short}8"]
 
         for term_code in terms_to_try:
@@ -517,7 +517,6 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     if incomp_match:
                         incompatibles.extend([c for c in extract_course_codes(incomp_match.group(1)) if c != clean_code])
 
-                    # Extract program restrictions from both text and mapped components (e.g. 1613 from crseOfrgRqmntGrp)
                     prog_restrictions = extract_program_restrictions(combined_req_text, mapped_components=mapped)
 
                     final_offerings = list(catalog_offerings)
@@ -530,7 +529,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                     cp_val = mapped.get("crseAwrdCrdtPnts", {}).get("value", {})
                     cp = str(cp_val.get("value", 10) if isinstance(cp_val, dict) else data.get("unitsMinimum", 10))
 
-                    result_meta = {
+                    return {
                         "code": clean_code,
                         "title": title,
                         "credit_points": cp,
@@ -547,21 +546,22 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                         "program_restrictions": prog_restrictions,
                         "from_curriculum_api": True
                     }
-                    return result_meta
             except Exception:
                 continue
 
     return None
-
-catalog = load_full_catalog()
 
 def lookup_course(clean_code: str, selected_year: int = None):
     if selected_year is None:
         selected_year = datetime.now().year
 
     catalog_entry = catalog.get(clean_code, {})
-    offerings = catalog_entry.get("offerings", [])
+    
+    # If already verified via Curriculum API, return immediately
+    if catalog_entry.get("from_curriculum_api"):
+        return catalog_entry
 
+    offerings = catalog_entry.get("offerings", [])
     curriculum_meta = fetch_course_from_curriculum_api(clean_code, selected_year, offerings)
     if curriculum_meta:
         catalog[clean_code] = curriculum_meta
@@ -570,6 +570,9 @@ def lookup_course(clean_code: str, selected_year: int = None):
     if catalog_entry:
         return catalog_entry
     return None
+
+catalog = load_full_catalog()
+
 
 # -----------------------------------------------------------------------------
 # 6. LIVE DEGREE SEARCH WITH FLUSHED DIAGNOSTICS & RESILIENT QUERYING
@@ -1581,14 +1584,31 @@ with st.sidebar:
             c_info = lookup_course(clean_code, planned_year)
 
             if c_info:
-                already_in_holding = clean_code in st.session_state.holding_zone
-                already_in_plan = any(clean_code in clist for clist in st.session_state.plan.values())
+                # 1. Program Compatibility Check
+                sel_deg = st.session_state.get("selected_degree")
+                planned_coords = {c: (yr, tr) for (yr, tr), clist in st.session_state.plan.items() for c in clist}
+                
+                is_compat = True
+                compat_msg = ""
+                if sel_deg:
+                    sel_deg_code = str(sel_deg.get("code", "")).strip()
+                    is_compat, compat_msg = is_course_degree_compatible(c_info, sel_deg_code, planned_coords)
 
-                if already_in_holding or already_in_plan:
-                    st.session_state.feedback_message = ("warning", f"**{clean_code}** is already in your holding zone or plan.")
+                if not is_compat:
+                    st.session_state.feedback_message = (
+                        "error", 
+                        f"❌ Cannot add **{clean_code}** ({c_info['title']}): {compat_msg}. You are currently planning **{sel_deg['title']} ({sel_deg_code})**."
+                    )
                 else:
-                    st.session_state.holding_zone.append(clean_code)
-                    st.session_state.feedback_message = ("success", f"Added **{clean_code}** - {c_info['title']} to Holding Zone!")
+                    already_in_holding = clean_code in st.session_state.holding_zone
+                    already_in_plan = any(clean_code in clist for clist in st.session_state.plan.values())
+
+                    if already_in_holding or already_in_plan:
+                        st.session_state.feedback_message = ("warning", f"**{clean_code}** is already in your holding zone or plan.")
+                    else:
+                        st.session_state.holding_zone.append(clean_code)
+                        pr_display = c_info.get("prereq_display", "No Prereqs")
+                        st.session_state.feedback_message = ("success", f"Added **{clean_code}** - {c_info['title']} to Holding Zone! (Requisites: {pr_display})")
             else:
                 st.session_state.feedback_message = ("error", f"Could not find course '{clean_code}'. Ensure the code is correct.")
         st.rerun()
@@ -1982,12 +2002,15 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
     if not holding_zone:
         html += "<div style='color: rgba(255,255,255,0.4); font-size: 12px; grid-column: 1/-1;'>No courses in holding zone. Add a course from the sidebar or click a course in the matrix to unschedule it.</div>"
 
+    # Inside build_planner_html -> Holding Zone Cards loop:
     for code in holding_zone:
         info = catalog_dict.get(code) or lookup_course(code) or {"title": code, "credit_points": "10", "offerings": [], "prereq_display": "No Prereqs", "group": ""}
         bg = string_to_pastel_hex(code)
         is_sel = "is-selected" if code == selected_code else ""
 
-        pr_text = f"Pre: {info.get('prereq_display', 'No Prereqs')}"
+        # Displays prerequisites, corequisites, and AND/OR rule groups
+        pr_display = info.get('prereq_display', 'No Prereqs')
+        pr_text = f"Pre: {pr_display}"
         cr_text = f" | Co: {', '.join(info['coreqs'])}" if info.get("coreqs") else ""
         offs = format_offerings_label(info.get("offerings", []))
 
@@ -2011,7 +2034,7 @@ def build_planner_html(holding_zone, plan, catalog_dict, num_years, include_t3, 
                 <span class="badge-pill">{offs}</span>
                 {or_badge}
             </div>
-            <div style="font-size: 9px; opacity: 0.9; margin-top: 5px; word-break: break-word;">{pr_text}{cr_text}</div>
+            <div style="font-size: 9.5px; opacity: 0.95; margin-top: 5px; word-break: break-word;">{pr_text}{cr_text}</div>
         </div>
         """
 
