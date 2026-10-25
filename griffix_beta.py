@@ -285,32 +285,80 @@ def is_course_offered_in_term(c_info: dict, trimester: int) -> bool:
         return any("summer" in o or "trimester 3" in o or "t3" in o for o in offs_lower)
     return False
 
+import traceback
+import time
+
 # -----------------------------------------------------------------------------
-# 5. FULL CATALOG LOADER (PAGINATED FOR COMPLETE ~2,700+ COURSES)
+# 5. FULL CATALOG LOADER WITH FLUSHED DIAGNOSTICS & WAF HEADERS
 # -----------------------------------------------------------------------------
-# -----------------------------------------------------------------------------
-# 5. CATALOG & LIVE CURRICULUM LOOKUP (FULL PAGINATED UNIVERSITY REGISTRY)
-# -----------------------------------------------------------------------------
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-AU,en-US;q=0.9,en;q=0.8",
+    "Referer": "https://www.griffith.edu.au/",
+    "Origin": "https://www.griffith.edu.au"
+}
+
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_full_catalog():
-    """Fetches ALL ~2,727 courses across Griffith using Funnelback pagination."""
+    """Fetches full course catalog across Griffith using Funnelback pagination with logging."""
+    print("\n" + "="*70, flush=True)
+    print("[CATALOG LOADER] Starting full catalog fetch...", flush=True)
     catalog = {}
-    headers = {
-        'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
-        'Accept': 'application/json, text/plain, */*'
-    }
-    base_url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&num_ranks=800&sort=metafborderna"
+    
+    # Try with padrenull query and conservative rank batch of 250
+    base_urls = [
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&query=!padrenull&sort=metafborderna&num_ranks=250",
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&sort=metafborderna&num_ranks=250",
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses&profile=_default&query=!padrenull&num_ranks=250"
+    ]
+
+    working_base = None
     start_rank = 1
 
-    for _ in range(6):  # 6 iterations x 800 covers up to 4,800 courses
-        url = f"{base_url}&start_rank={start_rank}"
+    for attempt_url in base_urls:
+        test_url = f"{attempt_url}&start_rank=1"
+        print(f"[CATALOG LOADER] Testing base endpoint: {test_url}", flush=True)
         try:
-            resp = requests.get(url, headers=headers, timeout=25)
+            t0 = time.time()
+            resp = requests.get(test_url, headers=BROWSER_HEADERS, timeout=15)
+            elapsed = time.time() - t0
+            print(f"[CATALOG LOADER] -> HTTP Status: {resp.status_code} ({elapsed:.2f}s)", flush=True)
+
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+                total = data.get("response", {}).get("resultPacket", {}).get("resultsSummary", {}).get("totalMatching", 0)
+                print(f"[CATALOG LOADER] -> Found {len(results)} items in first page (Total available: {total})", flush=True)
+                if results:
+                    working_base = attempt_url
+                    break
+            else:
+                print(f"[CATALOG LOADER] -> Non-200 response body sample: {resp.text[:250]}", flush=True)
+        except Exception as e:
+            print(f"[CATALOG LOADER] -> Connection failed: {e}", flush=True)
+
+    if not working_base:
+        print("[CATALOG LOADER] ❌ ERROR: All catalog endpoints failed. Returning empty catalog.", flush=True)
+        return {}
+
+    # Paginate through results
+    for page in range(1, 16):  # 15 iterations x 250 covers up to 3,750 courses
+        paginated_url = f"{working_base}&start_rank={start_rank}"
+        print(f"[CATALOG LOADER] Page {page}: Fetching start_rank={start_rank}...", flush=True)
+        try:
+            resp = requests.get(paginated_url, headers=BROWSER_HEADERS, timeout=20)
             if resp.status_code != 200:
+                print(f"[CATALOG LOADER] Page {page} returned status {resp.status_code}. Stopping pagination.", flush=True)
                 break
+            
             data = resp.json()
-            results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+            packet = data.get("response", {}).get("resultPacket", {})
+            results = packet.get("results", [])
+            total_matching = packet.get("resultsSummary", {}).get("totalMatching", 0)
+
             if not results:
+                print(f"[CATALOG LOADER] No more results found at page {page}.", flush=True)
                 break
 
             for item in results:
@@ -326,7 +374,6 @@ def load_full_catalog():
                 career = meta.get("academicCareerName", ["Undergraduate"])[0]
                 group = meta.get("academicGrpDescription", ["Other"])[0]
 
-                # Parse Requisites, CP Prerequisites & Program Restrictions
                 p_match = re.search(r'(?:pre-?requisite(?:s)?|advised prerequisite(?:s)?)\s*[:\-]?\s*([^.;\n]+)', desc, re.I)
                 p_text = p_match.group(1) if p_match and "nil" not in p_match.group(1).lower() else ""
                 fallback_groups = parse_rule_definition_to_groups("", p_text)
@@ -351,15 +398,20 @@ def load_full_catalog():
                     "program_restrictions": prog_restrictions
                 }
 
-            total_matching = data.get("response", {}).get("resultPacket", {}).get("resultsSummary", {}).get("totalMatching", 0)
+            print(f"[CATALOG LOADER] Processed page {page} (+{len(results)} items) -> Total parsed so far: {len(catalog)}", flush=True)
             start_rank += len(results)
             if start_rank > total_matching:
+                print(f"[CATALOG LOADER] Reached end of catalog (start_rank {start_rank} > total {total_matching}).", flush=True)
                 break
         except Exception as e:
-            print(f"Catalog fetch error at rank {start_rank}: {e}")
+            print(f"[CATALOG LOADER] Exception during pagination at start_rank {start_rank}: {e}", flush=True)
+            traceback.print_exc()
             break
 
+    print(f"[CATALOG LOADER] ✅ FINISHED: Successfully loaded {len(catalog)} total courses.", flush=True)
+    print("="*70 + "\n", flush=True)
     return catalog
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalog_offerings: list):
@@ -380,7 +432,7 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
     years_to_try = [search_year, search_year - 1]
 
     headers = {
-        "User-Agent": "Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
         "Ocp-Apim-Subscription-Key": subscription_key,
         "Origin": "https://my.griffith.edu.au",
         "Referer": "https://my.griffith.edu.au/"
@@ -404,7 +456,6 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                             rule_def = str(r.get("ruleDefinition", ""))
                             rule_sum = str(r.get("ruleSummary", ""))
 
-                            # Check Credit Point requirements (UNITS 80)
                             cp_req = extract_cp_prereq(rule_def, rule_sum, "")
                             if cp_req > min_cp:
                                 min_cp = cp_req
@@ -463,7 +514,8 @@ def fetch_course_from_curriculum_api(clean_code: str, selected_year: int, catalo
                         "incompatibles": list(dict.fromkeys(incompatibles)),
                         "program_restrictions": prog_restrictions
                     }
-            except Exception:
+            except Exception as e:
+                print(f"[CURRICULUM API] Failed for {clean_code} ({yr}/{term_code}): {e}", flush=True)
                 continue
 
     return None
@@ -487,27 +539,38 @@ def lookup_course(clean_code: str, selected_year: int = None):
     return None
 
 # -----------------------------------------------------------------------------
-# 6. LIVE DEGREE SEARCH & CURRICULUM PRESCRIBED STUDY PLAN
+# 6. LIVE DEGREE SEARCH WITH FLUSHED DIAGNOSTICS & RESILIENT QUERYING
 # -----------------------------------------------------------------------------
 def get_fallback_degrees():
+    print("[DEGREE SERVICE] ⚠️ Falling back to static degree list.", flush=True)
     raw_list = [
-        {"code": "1031", "title": "Bachelor of Biomedical Science", "campuses": ["Brisbane South", "Nathan"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Sciences"}]
+        {"code": "1031", "title": "Bachelor of Biomedical Science", "campuses": ["Brisbane South", "Nathan", "Gold Coast"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Sciences"},
+        {"code": "1651", "title": "Bachelor of Medical Science", "campuses": ["Brisbane South", "Nathan", "Gold Coast"], "intakes": ["Trimester 1"], "duration_years": 2, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Health"},
+        {"code": "1534", "title": "Bachelor of Computer Science", "campuses": ["Gold Coast", "Brisbane South (Nathan)"], "intakes": ["Trimester 1", "Trimester 2"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Sciences"},
+        {"code": "1280", "title": "Bachelor of Nursing", "campuses": ["Brisbane South (Nathan)", "Gold Coast", "Logan"], "intakes": ["Trimester 1"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Health"},
+        {"code": "1564", "title": "Bachelor of Business", "campuses": ["Brisbane South (Nathan)", "Gold Coast", "Online"], "intakes": ["Trimester 1", "Trimester 2", "Trimester 3"], "duration_years": 3, "career": "Undergraduate", "total_cp": 240, "group": "Griffith Business School"}
+    ]
     for d in raw_list:
         d["campuses"] = list(dict.fromkeys(normalize_campus_name(c) for c in d["campuses"]))
     return raw_list
 
+
 def parse_degree_results(results):
     degrees = []
-    for r in results:
+    print(f"[DEGREE PARSER] Parsing {len(results)} raw results...", flush=True)
+    for idx, r in enumerate(results):
         meta = r.get("listMetadata", {})
         codes = meta.get("code", [])
         code = str(codes[0]).strip() if codes else ""
         if not code:
-            url = r.get("liveUrl", "")
+            url = r.get("liveUrl", "") or item.get("displayUrl", "")
             match = re.search(r'-([0-9]{4})\b', url)
             if match:
                 code = match.group(1)
             else:
+                # Debug output for first 3 unparsed results
+                if idx < 3:
+                    print(f"[DEGREE PARSER] Skipped item #{idx} due to missing 4-digit code. Keys: {list(meta.keys())}, Title: {meta.get('title')}", flush=True)
                 continue
 
         title_list = meta.get("title", [])
@@ -552,47 +615,87 @@ def parse_degree_results(results):
             "total_cp": cp_val,
             "group": group
         })
+    print(f"[DEGREE PARSER] Successfully extracted {len(degrees)} valid degree programs.", flush=True)
     return degrees
+
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_all_degrees_catalog():
-    headers = {
-        'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
-        'Accept': 'application/json, text/plain, */*'
-    }
+    print("\n" + "="*70, flush=True)
+    print("[DEGREE SERVICE] Fetching all degrees catalog from Griffith API...", flush=True)
+    
+    # Priority order: broad query first, then fallback without query filter
     urls = [
-        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&sort=metafborderna&smeta_intlCohortYears_orsand=2026&smeta_intlCohortYears_orsand=2027&smeta_intlCohortYears_orsand=2028",
-        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&sort=metafborderna&query=!padrenull"
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&query=!padrenull&sort=metafborderna",
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&sort=metafborderna",
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees&profile=_default&query=!padrenull&num_ranks=350",
+        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&sort=metafborderna&smeta_intlCohortYears_orsand=2026&smeta_intlCohortYears_orsand=2027"
     ]
+    
     for url in urls:
+        print(f"[DEGREE SERVICE] Trying degrees endpoint: {url}", flush=True)
         try:
-            resp = requests.get(url, headers=headers, timeout=12)
+            t0 = time.time()
+            resp = requests.get(url, headers=BROWSER_HEADERS, timeout=12)
+            elapsed = time.time() - t0
+            print(f"[DEGREE SERVICE] -> Status: {resp.status_code} in {elapsed:.2f}s, Bytes: {len(resp.content)}", flush=True)
+
             if resp.status_code == 200:
                 data = resp.json()
                 results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+                total_matching = data.get("response", {}).get("resultPacket", {}).get("resultsSummary", {}).get("totalMatching", 0)
+                print(f"[DEGREE SERVICE] -> Raw results: {len(results)}, total matching: {total_matching}", flush=True)
+                
                 parsed = parse_degree_results(results)
                 if parsed:
+                    print(f"[DEGREE SERVICE] ✅ Successfully retrieved {len(parsed)} degrees from live API.", flush=True)
+                    print("="*70 + "\n", flush=True)
                     return parsed
-        except Exception:
-            continue
+                else:
+                    print(f"[DEGREE SERVICE] -> Got 200 OK but 0 degrees parsed. Raw JSON sample: {str(results[:1])[:300]}", flush=True)
+            else:
+                print(f"[DEGREE SERVICE] -> Failed with status {resp.status_code}. Response: {resp.text[:200]}", flush=True)
+        except Exception as e:
+            print(f"[DEGREE SERVICE] -> Exception while requesting {url}: {e}", flush=True)
+            traceback.print_exc()
+
+    print("[DEGREE SERVICE] ❌ All endpoints failed or returned 0 parsed degrees. Using fallback.", flush=True)
+    print("="*70 + "\n", flush=True)
     return get_fallback_degrees()
+
 
 def query_degrees_live(query_str: str):
     if not query_str or len(query_str.strip()) < 2:
         return []
     clean_q = urllib.parse.quote(query_str.strip())
-    url = f"https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=40&query={clean_q}&smeta_intlCohortYears_orsand=2026&smeta_intlCohortYears_orsand=2027&smeta_intlCohortYears_orsand=2028"
-    headers = {
-        'User-Agent': 'Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)',
-        'Accept': 'application/json, text/plain, */*'
-    }
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        if resp.status_code == 200:
-            data = resp.json()
-            return parse_degree_results(data.get("response", {}).get("resultPacket", {}).get("results", []))
-    except Exception as e:
-        print(f"Live degree query error: {e}")
+    print(f"\n[LIVE DEGREE SEARCH] Querying live: '{query_str.strip()}'...", flush=True)
+    
+    urls = [
+        f"https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=40&query={clean_q}",
+        f"https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=40&query={clean_q}&smeta_intlCohortYears_orsand=2026&smeta_intlCohortYears_orsand=2027"
+    ]
+    
+    for url in urls:
+        try:
+            print(f"[LIVE DEGREE SEARCH] Requesting: {url}", flush=True)
+            t0 = time.time()
+            resp = requests.get(url, headers=BROWSER_HEADERS, timeout=10)
+            elapsed = time.time() - t0
+            print(f"[LIVE DEGREE SEARCH] -> Status: {resp.status_code} in {elapsed:.2f}s", flush=True)
+            
+            if resp.status_code == 200:
+                data = resp.json()
+                results = data.get("response", {}).get("resultPacket", {}).get("results", [])
+                parsed = parse_degree_results(results)
+                if parsed:
+                    print(f"[LIVE DEGREE SEARCH] ✅ Found {len(parsed)} matching live degrees.", flush=True)
+                    return parsed
+            else:
+                print(f"[LIVE DEGREE SEARCH] -> Non-200 response: {resp.status_code} ({resp.text[:150]})", flush=True)
+        except Exception as e:
+            print(f"[LIVE DEGREE SEARCH] -> Exception: {e}", flush=True)
+            traceback.print_exc()
+
     return []
 
 def search_degrees(query: str, degrees: list):
