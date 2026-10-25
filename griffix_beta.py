@@ -556,110 +556,141 @@ def get_fallback_degrees():
 
 
 def parse_degree_results(results):
+    """Parses raw Funnelback degree results JSON into clean degree records."""
     degrees = []
-    print(f"[DEGREE PARSER] Parsing {len(results)} raw results...", flush=True)
-    for idx, r in enumerate(results):
+    print(f"[DEGREE PARSER] Parsing {len(results)} degree items from JSON...", flush=True)
+
+    for r in results:
         meta = r.get("listMetadata", {})
+        
+        # 1. Degree Code
         codes = meta.get("code", [])
         code = str(codes[0]).strip() if codes else ""
         if not code:
-            url = r.get("liveUrl", "") or item.get("displayUrl", "")
+            url = r.get("liveUrl", "") or r.get("displayUrl", "")
             match = re.search(r'-([0-9]{4})\b', url)
             if match:
                 code = match.group(1)
             else:
-                # Debug output for first 3 unparsed results
-                if idx < 3:
-                    print(f"[DEGREE PARSER] Skipped item #{idx} due to missing 4-digit code. Keys: {list(meta.keys())}, Title: {meta.get('title')}", flush=True)
                 continue
 
+        # 2. Title
         title_list = meta.get("title", [])
         title = title_list[0] if title_list else r.get("title", code)
-        campuses = meta.get("campusName", [])
-        intakes = meta.get("intakesName", [])
-        durations = meta.get("duration", [])
-        career = meta.get("academicCareer", ["Undergraduate"])[0]
-        group = meta.get("academicGroupDescription", ["Other"])[0]
 
+        # 3. Campuses
+        raw_campuses = meta.get("campusName", [])
         clean_campuses = []
-        for c in campuses:
+        for c in raw_campuses:
             norm = normalize_campus_name(c)
             if norm and norm not in clean_campuses:
                 clean_campuses.append(norm)
 
-        years = 3
-        for d in durations:
-            d_str = str(d).strip()
-            if d_str.isdigit() and 1 <= int(d_str) <= 6:
-                years = int(d_str)
-                break
-            match = re.search(r'(\d+)\s*years?', d_str, re.I)
-            if match:
-                years = int(match.group(1))
-                break
+        # 4. Intakes
+        intakes = list(dict.fromkeys(meta.get("intakesName", [])))
 
+        # 5. Duration (Extract undergraduate full-time years, avoiding 6-year part-time)
+        durations = meta.get("duration", [])
+        digit_durations = [
+            int(str(d).strip()) for d in durations 
+            if str(d).strip().isdigit() and 1 <= int(str(d).strip()) <= 6
+        ]
+        if digit_durations:
+            non_six = [x for x in digit_durations if x < 6]
+            years = min(non_six) if non_six else digit_durations[0]
+        else:
+            years = 3
+            for d in durations:
+                m = re.search(r'(\d+)\s*years?', str(d), re.I)
+                if m and int(m.group(1)) <= 6:
+                    years = int(m.group(1))
+                    break
+
+        # 6. Credit Points
         cp_val = 240
         for cp in meta.get("creditPoints", []):
             if str(cp).isdigit():
                 cp_val = int(cp)
                 break
 
+        career = meta.get("academicCareer", ["Undergraduate"])[0]
+        group = meta.get("academicGroupDescription", ["Other"])[0]
+
         degrees.append({
             "code": code,
             "title": title,
             "campuses": clean_campuses,
-            "intakes": list(dict.fromkeys(intakes)),
+            "intakes": intakes,
             "duration_years": years,
             "durations_raw": durations,
             "career": career,
             "total_cp": cp_val,
             "group": group
         })
-    print(f"[DEGREE PARSER] Successfully extracted {len(degrees)} valid degree programs.", flush=True)
+
+    print(f"[DEGREE PARSER] Successfully parsed {len(degrees)} degrees.", flush=True)
     return degrees
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_all_degrees_catalog():
+    """
+    Fetches all ~283 Griffith degrees in ONE call using num_ranks=500.
+    Does NOT use ?query= to avoid Cloudflare bot blocking.
+    """
+    url = "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=500&start_rank=1"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Language": "en-AU,en-US;q=0.9,en;q=0.8",
+        "Referer": "https://www.griffith.edu.au/",
+        "Origin": "https://www.griffith.edu.au"
+    }
+
     print("\n" + "="*70, flush=True)
-    print("[DEGREE SERVICE] Fetching all degrees catalog from Griffith API...", flush=True)
-    
-    # Priority order: broad query first, then fallback without query filter
-    urls = [
-        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&query=!padrenull&sort=metafborderna",
-        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&sort=metafborderna",
-        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees&profile=_default&query=!padrenull&num_ranks=350",
-        "https://search.griffith.edu.au/s/search.json?collection=griff~sp-degrees-api&profile=degrees&num_ranks=350&start_rank=1&sort=metafborderna&smeta_intlCohortYears_orsand=2026&smeta_intlCohortYears_orsand=2027"
-    ]
-    
-    for url in urls:
-        print(f"[DEGREE SERVICE] Trying degrees endpoint: {url}", flush=True)
-        try:
-            t0 = time.time()
-            resp = requests.get(url, headers=BROWSER_HEADERS, timeout=12)
-            elapsed = time.time() - t0
-            print(f"[DEGREE SERVICE] -> Status: {resp.status_code} in {elapsed:.2f}s, Bytes: {len(resp.content)}", flush=True)
+    print(f"[DEGREE SERVICE] Fetching full degrees list from:\n  -> {url}", flush=True)
 
-            if resp.status_code == 200:
-                data = resp.json()
-                results = data.get("response", {}).get("resultPacket", {}).get("results", [])
-                total_matching = data.get("response", {}).get("resultPacket", {}).get("resultsSummary", {}).get("totalMatching", 0)
-                print(f"[DEGREE SERVICE] -> Raw results: {len(results)}, total matching: {total_matching}", flush=True)
-                
-                parsed = parse_degree_results(results)
-                if parsed:
-                    print(f"[DEGREE SERVICE] ✅ Successfully retrieved {len(parsed)} degrees from live API.", flush=True)
-                    print("="*70 + "\n", flush=True)
-                    return parsed
-                else:
-                    print(f"[DEGREE SERVICE] -> Got 200 OK but 0 degrees parsed. Raw JSON sample: {str(results[:1])[:300]}", flush=True)
-            else:
-                print(f"[DEGREE SERVICE] -> Failed with status {resp.status_code}. Response: {resp.text[:200]}", flush=True)
-        except Exception as e:
-            print(f"[DEGREE SERVICE] -> Exception while requesting {url}: {e}", flush=True)
-            traceback.print_exc()
+    try:
+        t0 = time.time()
+        resp = requests.get(url, headers=headers, timeout=15)
+        elapsed = time.time() - t0
+        print(f"[DEGREE SERVICE] HTTP Status: {resp.status_code} ({elapsed:.2f}s)", flush=True)
 
-    print("[DEGREE SERVICE] ❌ All endpoints failed or returned 0 parsed degrees. Using fallback.", flush=True)
+        if resp.status_code == 200:
+            data = resp.json()
+            packet = data.get("response", {}).get("resultPacket", {})
+            results = packet.get("results", [])
+            total_matching = packet.get("resultsSummary", {}).get("totalMatching", 0)
+            print(f"[DEGREE SERVICE] Funnelback reports totalMatching: {total_matching}, received: {len(results)}", flush=True)
+
+            parsed = parse_degree_results(results)
+            if parsed:
+                print(f"[DEGREE SERVICE] ✅ Successfully cached {len(parsed)} degrees in memory.", flush=True)
+                print("="*70 + "\n", flush=True)
+                return parsed
+        else:
+            print(f"[DEGREE SERVICE] ⚠️ Live endpoint returned {resp.status_code}. Checking local files...", flush=True)
+
+    except Exception as e:
+        print(f"[DEGREE SERVICE] ⚠️ Network request failed: {e}. Checking local files...", flush=True)
+
+    # Local fallback if degree_data1json.json is placed in your project directory
+    for local_filename in ["degree_data1json.json", "degrees.json"]:
+        if os.path.exists(local_filename):
+            print(f"[DEGREE SERVICE] Loading degrees from local file: {local_filename}", flush=True)
+            try:
+                with open(local_filename, "r", encoding="utf-8") as f:
+                    local_data = json.load(f)
+                    local_results = local_data.get("response", {}).get("resultPacket", {}).get("results", [])
+                    parsed = parse_degree_results(local_results)
+                    if parsed:
+                        print(f"[DEGREE SERVICE] ✅ Loaded {len(parsed)} degrees from {local_filename}.", flush=True)
+                        print("="*70 + "\n", flush=True)
+                        return parsed
+            except Exception as e:
+                print(f"[DEGREE SERVICE] Error reading {local_filename}: {e}", flush=True)
+
+    print("[DEGREE SERVICE] ⚠️ Using static fallback degrees.", flush=True)
     print("="*70 + "\n", flush=True)
     return get_fallback_degrees()
 
@@ -699,41 +730,58 @@ def query_degrees_live(query_str: str):
     return []
 
 def search_degrees(query: str, degrees: list):
+    """Matches user keywords against the pre-fetched catalog entirely in Python."""
     if not query:
-        return degrees[:20]
+        return degrees[:25]
+
     q = query.strip().lower()
     q_words = q.split()
 
-    direct = [d for d in degrees if all(w in f"{d['title']} {d['code']}".lower() for w in q_words)]
-    if direct:
-        return direct
+    # 1. Exact 4-digit code match (e.g. '1280' or '1162')
+    exact_code = [d for d in degrees if d.get('code') == q]
+    if exact_code:
+        return exact_code
 
+    # 2. Token match: ALL query words must appear in Title or Code
+    matched = []
+    for d in degrees:
+        title_lower = d.get('title', '').lower()
+        code_str = d.get('code', '').lower()
+        search_corpus = f"{title_lower} {code_str}"
+
+        if all(w in search_corpus for w in q_words):
+            # Prioritize exact phrase match over separated words
+            exact_phrase = q in title_lower
+            matched.append((exact_phrase, d))
+
+    if matched:
+        # Sort exact phrase first, then alphabetically by title
+        matched.sort(key=lambda x: (not x[0], x[1].get('title', '')))
+        return [d for _, d in matched[:30]]
+
+    # 3. Fuzzy match fallback for slight typos
     scored = []
     for d in degrees:
-        target = f"{d['title']} {d['code']}".lower()
+        target = f"{d.get('title', '')} {d.get('code', '')}".lower()
         full_ratio = difflib.SequenceMatcher(None, q, target).ratio()
         word_ratios = [max(difflib.SequenceMatcher(None, qw, tw).ratio() for tw in target.split()) for qw in q_words]
         avg_word_ratio = sum(word_ratios) / len(word_ratios) if word_ratios else 0
         best_score = max(full_ratio, avg_word_ratio)
         if best_score > 0.50:
             scored.append((best_score, d))
+
     scored.sort(key=lambda x: x[0], reverse=True)
-    return [d for _, d in scored[:20]]
+    return [d for _, d in scored[:25]]
 
 def get_matching_degrees(query: str):
+    """Pure in-memory Python search against the 500-ranks downloaded catalog."""
     if not query:
         return []
-    catalog_list = fetch_all_degrees_catalog()
-    local_matches = search_degrees(query, catalog_list)
-    live_matches = query_degrees_live(query)
 
-    combined = []
-    seen = set()
-    for d in live_matches + local_matches:
-        if d['code'] not in seen:
-            seen.add(d['code'])
-            combined.append(d)
-    return combined
+    catalog_list = fetch_all_degrees_catalog()
+    results = search_degrees(query, catalog_list)
+    print(f"[SEARCH DEGREE] Query '{query.strip()}' matched {len(results)} program(s): {[d['title'] + ' (' + d['code'] + ')' for d in results[:4]]}", flush=True)
+    return results
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def fetch_degree_program_rules(degree_code: str):
