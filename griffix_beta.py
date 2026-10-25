@@ -1270,38 +1270,44 @@ CLINICAL_DISCIPLINE_RESTRICTIONS = {
     "MID": ["1354"],          # Midwifery only
 }
 
-def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
-    code = c_info.get("code")
-    subj_area = c_info.get("subject_area") or get_course_subject_area(code)
+def is_course_degree_compatible(c_info: dict, sel_deg_code: str, planned_coords: dict) -> tuple[bool, str]:
+    """Returns (False, reason) if the course is restricted to another degree or incompatible."""
+    code = c_info.get("code", "")
+    subj = c_info.get("subject_area") or get_course_subject_area(code)
 
-    # 1. Subject Area / Clinical Discipline Restriction
-    if selected_degree_code and subj_area in CLINICAL_DISCIPLINE_RESTRICTIONS:
-        allowed_progs = CLINICAL_DISCIPLINE_RESTRICTIONS[subj_area]
-        if str(selected_degree_code).strip() not in allowed_progs:
-            return False, None, f"🚫 Restricted: {subj_area} courses are restricted to program(s): {', '.join(allowed_progs)}", []
+    # 1. Clinical Subject Area Restriction
+    if sel_deg_code and subj in CLINICAL_DISCIPLINE_RESTRICTIONS:
+        allowed = CLINICAL_DISCIPLINE_RESTRICTIONS[subj]
+        if str(sel_deg_code).strip() not in allowed:
+            return False, f"🚫 Restricted: {subj} courses are restricted to program(s): {', '.join(allowed)}"
 
-    # 2. Specific Program / Degree Restriction from API
-    prog_restr = c_info.get("program_restrictions", [])
-    if prog_restr and selected_degree_code:
-        deg_code_clean = str(selected_degree_code).strip()
-        restr_clean = [str(x).strip() for x in prog_restr]
-        if deg_code_clean not in restr_clean:
-            return False, None, f"🚫 Restricted: Only open to students in program(s): {', '.join(restr_clean)}", []
+    # 2. Specific Program Restrictions from API
+    prog_restr = [str(x).strip() for x in c_info.get("program_restrictions", []) if str(x).strip()]
+    if prog_restr and sel_deg_code:
+        if str(sel_deg_code).strip() not in prog_restr:
+            return False, f"🚫 Restricted: Only open to students in program(s): {', '.join(prog_restr)}"
 
-    # 3. Incompatibility / Anti-requisites Check
-    incomps = c_info.get("incompatibles", [])
-    for inc in incomps:
+    # 3. Incompatibles / Anti-requisites in current plan
+    for inc in c_info.get("incompatibles", []):
         if inc in planned_coords:
             pyr, ptr = planned_coords[inc]
-            return False, None, f"🚫 Incompatible with {inc} (scheduled in plan Y{pyr} T{ptr})", []
+            return False, f"🚫 Incompatible with {inc} (scheduled in plan Y{pyr} T{ptr})"
 
-    # 4. Mandatory Co-requisites Check
+    return True, ""
+
+def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, selected_degree_code: str = None) -> tuple[bool, tuple | None, str, list]:
+    # 1. Degree compatibility & Anti-requisites Check
+    is_compat, compat_msg = is_course_degree_compatible(c_info, selected_degree_code, planned_coords)
+    if not is_compat:
+        return False, None, compat_msg, []
+
+    # 2. Mandatory Co-requisites Check
     coreqs = c_info.get("coreqs", [])
     missing_coreqs = [cr for cr in coreqs if cr not in planned_coords]
     if missing_coreqs:
         return False, None, f"⚠️ Requires co-enrolment in: {', '.join(missing_coreqs)}", []
 
-    # 5. Cumulative CP Check
+    # 3. Calculate cumulative CP progression by term
     sorted_terms = sorted(plan.keys(), key=lambda t: term_index(t[0], t[1]))
     cum_cp_before_term = {}
     running_cp = 0
@@ -1310,6 +1316,7 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         term_courses = plan[t]
         running_cp += sum(int((catalog.get(tc) or {}).get("credit_points", 10) or 10) for tc in term_courses)
 
+    # 4. Minimum CP Prerequisite Check (e.g. 80 CP)
     min_cp = c_info.get("min_cp_prereq", 0)
     latest_term_cp = 0
     cp_sat_msg = ""
@@ -1324,7 +1331,7 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         latest_term_cp = term_index(eligible_term_for_cp[0], eligible_term_for_cp[1]) - 1
         cp_sat_msg = f"{min_cp} CP completed"
 
-    # 6. Course Prerequisites Check
+    # 5. Course Prerequisites Check
     p_groups = c_info.get("prereq_groups", [])
     latest_term_courses = 0
     missing_groups = []
@@ -2200,16 +2207,10 @@ elif st.session_state.plan:
 # -----------------------------------------------------------------------------
 if st.session_state.get("selected_degree"):
     with st.expander("💡 Elective & University Course Explorer (Full Catalog)", expanded=False):
-        print("\n" + "="*70, flush=True)
-        print("[EXPLORER TRACE] Opening Course Explorer...", flush=True)
-        print(f"[EXPLORER TRACE] In-memory catalog size: {len(catalog)} courses", flush=True)
-
-        deg_flex_list = st.session_state.get("degree_flex_courses", [])
-        print(f"[EXPLORER TRACE] Degree recommended flexible courses: {len(deg_flex_list)} ({deg_flex_list[:6]})", flush=True)
-
         if "sug_page" not in st.session_state:
             st.session_state.sug_page = 1
 
+        deg_flex_set = set(st.session_state.get("degree_flex_courses", []))
         core_set = {c["code"] for c in st.session_state.get("degree_core_courses", [])}
         planned_coords = {c: (yr, tr) for (yr, tr), clist in st.session_state.plan.items() for c in clist}
         planned_or_held = set(planned_coords.keys()) | set(st.session_state.holding_zone)
@@ -2219,46 +2220,42 @@ if st.session_state.get("selected_degree"):
         seen_cand = set()
 
         # 1. Degree Recommended Flexible Courses (Placed First)
-        for f_code in deg_flex_list:
+        for f_code in st.session_state.get("degree_flex_courses", []):
             if f_code not in core_set and f_code not in planned_or_held and f_code not in seen_cand:
-                info = catalog.get(f_code) or lookup_course(f_code) or {}
+                info = lookup_course(f_code) or catalog.get(f_code) or {}
                 if info and info.get("code"):
                     c_copy = dict(info)
                     c_copy["is_degree_recommended"] = True
                     candidates.append(c_copy)
                     seen_cand.add(f_code)
 
-        print(f"[EXPLORER TRACE] Candidates from degree flexible module: {len(candidates)}", flush=True)
-
-        # 2. Universal Course Catalog across all faculties (e.g. ALL MSC, ESC, NSC courses)
-        catalog_candidates_count = 0
+        # 2. Universal Course Catalog across all faculties
         for c_code, c_info in catalog.items():
             if c_code not in core_set and c_code not in planned_or_held and c_code not in seen_cand:
                 career = str(c_info.get("career", "")).lower()
                 if "postgrad" not in career and "research" not in career:
                     c_copy = dict(c_info)
-                    c_copy["is_degree_recommended"] = False
+                    c_copy["is_degree_recommended"] = (c_code in deg_flex_set)
                     candidates.append(c_copy)
                     seen_cand.add(c_code)
-                    catalog_candidates_count += 1
 
-        print(f"[EXPLORER TRACE] Additional candidates added from full catalog: {catalog_candidates_count}", flush=True)
-        print(f"[EXPLORER TRACE] Total candidate pool before filters: {len(candidates)} courses", flush=True)
-
-        if len(catalog) == 0:
-            st.warning("⚠️ Full university catalog is running in offline mode. Commit `courses.json` to your GitHub repo to unlock all 3,000 electives across all faculties.")
-
-        # Evaluate Whole-Degree Prerequisite Satisfaction & CP requirements
+        # Evaluate Whole-Degree Prerequisite Satisfaction & Compatibility
         candidate_evaluations = []
         for c in candidates:
+            code = c["code"]
+            is_compat, compat_msg = is_course_degree_compatible(c, sel_deg_code, planned_coords)
             is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(c, st.session_state.plan, planned_coords, sel_deg_code)
-            lvl_lbl = get_course_level_label(c["code"])
-            subj_area = c.get("subject_area") or get_course_subject_area(c["code"])
+            lvl_lbl = get_course_level_label(code)
+            subj_area = c.get("subject_area") or get_course_subject_area(code)
             rank_score = term_index(early_term[0], early_term[1]) if early_term else 9999
+
+            is_rec = (code in deg_flex_set) or c.get("is_degree_recommended", False)
 
             candidate_evaluations.append({
                 "course": c,
                 "is_eligible": is_elig,
+                "is_degree_compat": is_compat,
+                "is_degree_recommended": is_rec,
                 "earliest_term": early_term,
                 "earliest_term_rank": rank_score,
                 "explanation": expl_msg,
@@ -2266,9 +2263,6 @@ if st.session_state.get("selected_degree"):
                 "level": lvl_lbl,
                 "subject_area": subj_area
             })
-
-        print(f"[EXPLORER TRACE] Prerequisite evaluation complete for {len(candidate_evaluations)} courses.", flush=True)
-        print("="*70 + "\n", flush=True)
 
         # --- MULTISELECT CONTROLS & FILTER BAR ---
         col_f1, col_f2, col_f3 = st.columns([1.8, 1.3, 1.4])
@@ -2305,7 +2299,7 @@ if st.session_state.get("selected_degree"):
                 "Only show courses with prerequisites satisfied in plan",
                 value=True,
                 key="sug_filter_prereq_met",
-                help="Filters to courses with no prerequisites, satisfied course prerequisites, or satisfied credit-point requirements (e.g. 80 CP)."
+                help="Filters to courses that are compatible with your degree and have all prerequisites satisfied in your current plan."
             )
         with col_pp:
             per_page = st.selectbox("Per Page", options=[10, 25, 50], index=0, key="sug_per_page")
@@ -2321,9 +2315,13 @@ if st.session_state.get("selected_degree"):
             lvl = item["level"]
             area = item["subject_area"]
             is_eligible = item["is_eligible"]
+            is_compat = item["is_degree_compat"]
 
-            if only_prereqs_met and not is_eligible:
-                continue
+            # If checked, DO NOT SHOW incompatible degree courses or unsatisfied prereqs
+            if only_prereqs_met:
+                if not is_compat or not is_eligible:
+                    continue
+
             if sel_groups and grp not in sel_groups:
                 continue
             if sel_levels and lvl not in sel_levels:
@@ -2337,9 +2335,9 @@ if st.session_state.get("selected_degree"):
 
             filtered_sug.append(item)
 
-        # Sort: Recommended electives first, then eligible courses, then by earliest availability
+        # Sort: Recommended electives ALWAYS first, then eligible courses, then by earliest availability
         filtered_sug.sort(key=lambda x: (
-            not x["course"].get("is_degree_recommended", False),
+            not x["is_degree_recommended"],
             not x["is_eligible"],
             x["earliest_term_rank"],
             x["course"]["code"]
@@ -2374,7 +2372,7 @@ if st.session_state.get("selected_degree"):
                         st.session_state.sug_page += 1
                         st.rerun()
 
-            # --- CSS INJECTION FOR MODERN COURSE ROWS ---
+            # --- CSS INJECTION FOR MODERN COURSE ROWS & BADGES ---
             st.markdown(
                 """
                 <style>
@@ -2402,7 +2400,13 @@ if st.session_state.get("selected_degree"):
                 .tag-level { background: rgba(165, 94, 234, 0.18); color: #a55eea; border: 1px solid rgba(165, 94, 234, 0.35); }
                 .tag-off { background: rgba(255, 165, 2, 0.18); color: #ffa502; border: 1px solid rgba(255, 165, 2, 0.35); }
                 .tag-cp { background: rgba(255, 255, 255, 0.1); color: #f1f2f6; }
-                .tag-rec { background: rgba(255, 215, 0, 0.2); color: #ffd700; border: 1px solid #ffd700; }
+                .tag-rec { 
+                    background: rgba(255, 215, 0, 0.25) !important; 
+                    color: #ffd700 !important; 
+                    border: 1px solid #ffd700 !important;
+                    font-weight: 800 !important;
+                    letter-spacing: 0.5px !important;
+                }
                 .status-ready { color: #2ed573; font-weight: 600; font-size: 11px; }
                 .status-pending { color: #ff9f1a; font-weight: 600; font-size: 11px; }
                 </style>
@@ -2410,22 +2414,21 @@ if st.session_state.get("selected_degree"):
                 unsafe_allow_html=True
             )
 
-            # Live-enrich items on the current page with full Curriculum API requisites
             for item in page_items:
                 c_code = item["course"]["code"]
-                # If course only has stub data, fetch full details from Curriculum API
+                was_rec = item["is_degree_recommended"]
+
+                # Enrich with Curriculum API data if not already fetched
                 if not item["course"].get("from_curriculum_api"):
                     enriched = lookup_course(c_code)
                     if enriched:
+                        enriched["is_degree_recommended"] = was_rec
                         item["course"] = enriched
-                        # Re-evaluate with full Curriculum API requisites
                         is_elig, early_term, expl_msg, missing = evaluate_elective_prereqs(
                             enriched, st.session_state.plan, planned_coords, sel_deg_code
                         )
                         item["is_eligible"] = is_elig
-                        item["earliest_term"] = early_term
                         item["explanation"] = expl_msg
-                        item["missing"] = missing
 
                 c_info = item["course"]
                 title = c_info["title"]
@@ -2433,11 +2436,10 @@ if st.session_state.get("selected_degree"):
                 offs = format_offerings_label(c_info.get("offerings", []))
                 area_tag = item["subject_area"]
                 lvl_tag = item["level"].split(" ")[0] + " " + item["level"].split(" ")[1]
-                is_rec = c_info.get("is_degree_recommended", False)
                 expl = item["explanation"]
 
                 status_class = "status-ready" if item["is_eligible"] else "status-pending"
-                rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if is_rec else ''
+                rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if item["is_degree_recommended"] else ''
 
                 with st.container():
                     c_main, c_btn = st.columns([5.3, 0.7])
