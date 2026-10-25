@@ -2857,7 +2857,7 @@ if st.session_state.get("selected_degree"):
                 div[data-testid="stHorizontalBlock"]:has(.sug-card) button {
                     margin: 0 !important;
                     white-space: nowrap !important;
-                    min-height: 42px !important;
+                    min-height: 40px !important;
                 }
 
                 .sug-card {
@@ -2874,15 +2874,16 @@ if st.session_state.get("selected_degree"):
                     background: rgba(255, 255, 255, 0.05);
                 }
 
+                /* Locks all tags into one perfectly level horizontal row */
                 .tags-row {
-                    display: flex;
-                    align-items: center;
-                    flex-wrap: nowrap;
-                    gap: 6px;
-                    overflow-x: auto;
-                    white-space: nowrap;
-                    margin-top: 6px;
-                    margin-bottom: 6px;
+                    display: flex !important;
+                    align-items: center !important;
+                    flex-wrap: nowrap !important;
+                    gap: 6px !important;
+                    overflow-x: auto !important;
+                    white-space: nowrap !important;
+                    margin-top: 6px !important;
+                    margin-bottom: 6px !important;
                     scrollbar-width: none;
                     -ms-overflow-style: none;
                 }
@@ -2890,38 +2891,44 @@ if st.session_state.get("selected_degree"):
                     display: none;
                 }
 
+                /* Uniform 22px height & vertical centering for every pill */
                 .tag-pill {
-                    display: inline-flex;
-                    align-items: center;
-                    white-space: nowrap;
-                    flex-shrink: 0;
-                    padding: 2px 8px;
-                    border-radius: 4px;
-                    font-size: 10px;
-                    font-weight: 700;
-                    line-height: 1.3;
+                    display: inline-flex !important;
+                    align-items: center !important;
+                    justify-content: center !important;
+                    vertical-align: middle !important;
+                    box-sizing: border-box !important;
+                    height: 22px !important;
+                    padding: 0 8px !important;
+                    border-radius: 4px !important;
+                    font-size: 10px !important;
+                    font-weight: 700 !important;
+                    line-height: 1 !important;
+                    white-space: nowrap !important;
+                    flex-shrink: 0 !important;
                 }
+
                 .tag-area { background: rgba(112, 161, 255, 0.18); color: #70a1ff; border: 1px solid rgba(112, 161, 255, 0.35); }
                 .tag-level { background: rgba(165, 94, 234, 0.18); color: #a55eea; border: 1px solid rgba(165, 94, 234, 0.35); }
                 .tag-off { background: rgba(255, 165, 2, 0.18); color: #ffa502; border: 1px solid rgba(255, 165, 2, 0.35); }
+                .tag-cp { background: rgba(255, 255, 255, 0.08); color: #f1f2f6; border: 1px solid rgba(255, 255, 255, 0.15); }
                 .tag-group { background: rgba(255, 255, 255, 0.08) !important; color: #d1d8e0 !important; border: 1px solid rgba(255, 255, 255, 0.15) !important; }
 
                 /* 100% Solid Non-Transparent Campus Badges */
                 .tag-campus { 
                     background: #00564d !important; 
                     color: #ffffff !important; 
-                    border: 1.5px solid #00b894 !important; 
+                    border: 1px solid #00b894 !important; 
                     opacity: 1 !important;
                 }
                 .tag-campus-warn { 
                     background: #8b0000 !important; 
                     color: #ffffff !important; 
-                    border: 1.5px solid #ff4d4d !important; 
+                    border: 1px solid #ff4d4d !important; 
                     opacity: 1 !important;
                     box-shadow: 0 0 6px rgba(255, 77, 77, 0.6) !important;
                 }
 
-                .tag-cp { background: rgba(255, 255, 255, 0.1); color: #f1f2f6; }
                 .tag-rec { 
                     background: rgba(255, 215, 0, 0.25) !important; 
                     color: #ffd700 !important; 
@@ -2967,7 +2974,6 @@ if st.session_state.get("selected_degree"):
                 rec_badge = '<span class="tag-pill tag-rec">⭐ RECOMMENDED ELECTIVE</span>' if item["is_degree_recommended"] else ''
 
                 with st.container():
-                    # 4.85 : 1.15 gives plenty of room for '➕ Add' without truncation
                     try:
                         c_main, c_btn = st.columns([4.85, 1.15], vertical_alignment="center")
                     except TypeError:
