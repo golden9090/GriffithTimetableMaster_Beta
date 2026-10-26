@@ -549,41 +549,59 @@ def get_live_course_cache():
     """Persistent RAM cache across reruns (stores dicts or 'NOT_FOUND')."""
     return {}
 
+def check_campus_match(course_cmps: list, filter_cmps: list) -> bool:
+    """Returns True if any of course_cmps matches any of filter_cmps (or if filter is empty)."""
+    if not filter_cmps:
+        return True
+    if not course_cmps:
+        return False
+    norm_course = [normalize_campus_name(x).strip().lower() for x in course_cmps if x]
+    for fc in filter_cmps:
+        norm_fc = normalize_campus_name(fc).strip().lower()
+        if any(norm_fc == c or norm_fc in c or c in norm_fc for c in norm_course):
+            return True
+    return False
+
 def _fetch_course_api_worker(http_session, clean_code: str, selected_year: int, catalog_offerings: list):
-    """Thread-safe worker to fetch Curriculum API metadata with dual keys and fallback extraction."""
+    """Thread-safe worker to fetch Curriculum API metadata with Cloudflare-safe requests and dual keys."""
     keys_to_try = ["b8ae10d400ef42f89a127abe4a760e46", "5145ba30d5734d4cb6047c47527ef930"]
 
     offs_lower = [str(o).lower() for o in (catalog_offerings or [])]
     preferred_tris = []
     if any("trimester 1" in o or "t1" in o for o in offs_lower):
-        preferred_tris.append("1")
+        preferred_tris.append(("1", "Trimester 1"))
     if any("trimester 2" in o or "t2" in o for o in offs_lower):
-        preferred_tris.append("5")
+        preferred_tris.append(("5", "Trimester 2"))
     if any("summer" in o or "trimester 3" in o or "t3" in o for o in offs_lower):
-        preferred_tris.append("8")
-    for t_dig in ["1", "5", "8"]:
-        if t_dig not in preferred_tris:
-            preferred_tris.append(t_dig)
+        preferred_tris.append(("8", "Trimester 3"))
 
-    years_to_try = list(dict.fromkeys([y for y in [selected_year, 2026, 2027, 2025] if y]))[:2]
+    for t_dig, t_name in [("1", "Trimester 1"), ("5", "Trimester 2"), ("8", "Trimester 3")]:
+        if not any(t_dig == x[0] for x in preferred_tris):
+            preferred_tris.append((t_dig, t_name))
+
+    years_to_try = list(dict.fromkeys([y for y in [selected_year, 2026, 2025, 2027, 2024] if y]))
+
+    print(f"[COURSE WORKER] 🔍 Starting lookup for {clean_code} (years: {years_to_try[:3]}, offerings: {catalog_offerings})", flush=True)
 
     for yr in years_to_try:
         yr_short = str(yr)[-2:]
-        terms_to_try = [f"3{yr_short}{t_dig}" for t_dig in preferred_tris]
+        for t_dig, t_name in preferred_tris:
+            term_variants = [f"3{yr_short}{t_dig}", urllib.parse.quote(t_name)]
+            for term_code in term_variants:
+                for sub_key in keys_to_try:
+                    headers = {
+                        "User-Agent": "Griffix-Live-Degree-Planner-StudentProject (Contact: yiming.qu@griffithuni.edu.au)",
+                        "Ocp-Apim-Subscription-Key": sub_key,
+                        "Origin": "https://my.griffith.edu.au",
+                        "Referer": "https://my.griffith.edu.au/"
+                    }
+                    url = f"https://api-lt.griffith.edu.au/curriculumapi/v1/course/{clean_code}/{yr}/{term_code}?subscription-key={sub_key}"
 
-        for term_code in terms_to_try:
-            for sub_key in keys_to_try:
-                headers = {
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Ocp-Apim-Subscription-Key": sub_key,
-                    "Origin": "https://my.griffith.edu.au",
-                    "Referer": "https://my.griffith.edu.au/"
-                }
-                url = f"https://api-lt.griffith.edu.au/curriculumapi/v1/course/{clean_code}/{yr}/{term_code}?subscription-key={sub_key}"
-                try:
-                    resp = http_session.get(url, headers=headers, timeout=4)
-                    if resp.status_code == 200:
-                        data = resp.json()
+                    status_code, response_data = cloudflare_safe_get(url, timeout=5, extra_headers=headers)
+                    print(f"[COURSE WORKER] {clean_code} -> GET {url} -> Status {status_code}", flush=True)
+
+                    if status_code == 200 and isinstance(response_data, dict):
+                        data = response_data
                         mapped = data.get("mappedData", {}).get("components", {})
 
                         prereq_groups, coreqs, incompatibles = [], [], []
@@ -621,9 +639,9 @@ def _fetch_course_api_worker(http_session, clean_code: str, selected_year: int, 
                         if desc_cp > min_cp:
                             min_cp = desc_cp
 
-                        # Extract text-based prerequisites if crseRequiste was empty
+                        # Extract text-based prerequisites if structured requisites were empty
                         if not prereq_groups:
-                            prereq_match = re.search(r'(?:pre-?requisite(?:s)?|prior to enrolling[^.;\n]*completed)\s*[:\-]?\s*([^.;\n<]+)', combined_req_text, re.I)
+                            prereq_match = re.search(r'(?:(?:course\s+)?pre-?requisite(?:s)?|prior to enrolling[^.;\n]*completed|must have completed|enrolment requisite(?:s)?)\s*[:\-]?\s*([^.;\n<]+)', combined_req_text, re.I)
                             if prereq_match:
                                 text_groups = parse_rule_definition_to_groups("", prereq_match.group(1))
                                 for g in text_groups:
@@ -671,6 +689,8 @@ def _fetch_course_api_worker(http_session, clean_code: str, selected_year: int, 
                         cp_val = mapped.get("crseAwrdCrdtPnts", {}).get("value", {})
                         cp = str(cp_val.get("value", 10) if isinstance(cp_val, dict) else data.get("unitsMinimum", 10))
 
+                        print(f"[COURSE WORKER] ✅ {clean_code} successfully parsed: Prereqs={prereq_groups}, MinCP={min_cp}, Campuses={final_campuses}", flush=True)
+
                         return {
                             "code": clean_code,
                             "title": title,
@@ -689,12 +709,111 @@ def _fetch_course_api_worker(http_session, clean_code: str, selected_year: int, 
                             "program_restrictions": prog_restrictions,
                             "from_curriculum_api": True
                         }
-                    elif resp.status_code in [401, 403]:
-                        continue  # Try next subscription key
-                except Exception:
-                    continue
+                    elif status_code in [401, 403]:
+                        continue
 
+    # Fallback to Funnelback search if Curriculum API did not return 200
+    print(f"[COURSE WORKER] ⚠️ {clean_code} not found in Curriculum API. Trying Funnelback live search fallback...", flush=True)
+    fb_url = f"https://search.griffith.edu.au/s/search.json?collection=griff~sp-courses-api&profile=courses&query={clean_code}"
+    fb_status, fb_data = cloudflare_safe_get(fb_url, timeout=6)
+    if fb_status == 200 and isinstance(fb_data, dict):
+        results = fb_data.get("response", {}).get("resultPacket", {}).get("results", [])
+        for item in results:
+            meta = item.get("listMetadata", {})
+            cat_numbers = meta.get("categoryNumber", [])
+            if cat_numbers and str(cat_numbers[0]).replace(" ", "").upper().strip() == clean_code:
+                desc = meta.get("description", [""])[0] or ""
+                raw_cmps = meta.get("campusName", []) or meta.get("campus", [])
+                clean_cmps = list(dict.fromkeys([normalize_campus_name(x) for x in raw_cmps if normalize_campus_name(x)]))
+
+                prereq_match = re.search(r'(?:(?:course\s+)?pre-?requisite(?:s)?|prior to enrolling[^.;\n]*completed|must have completed|enrolment requisite(?:s)?)\s*[:\-]?\s*([^.;\n<]+)', desc, re.I)
+                prereq_text = prereq_match.group(1) if prereq_match else desc
+                fallback_groups = parse_rule_definition_to_groups("", prereq_text)
+
+                fb_res = {
+                    "code": clean_code,
+                    "title": meta.get("title", [clean_code])[0],
+                    "credit_points": meta.get("creditPoints", ["10"])[0],
+                    "description": desc,
+                    "offerings": list(set(meta.get("nextOffering", []))),
+                    "campuses": clean_cmps,
+                    "career": meta.get("academicCareerName", ["Undergraduate"])[0],
+                    "group": meta.get("academicGrpDescription", ["Other"])[0],
+                    "subject_area": get_course_subject_area(clean_code),
+                    "prereq_groups": fallback_groups,
+                    "prereq_display": format_prereq_display(fallback_groups),
+                    "min_cp_prereq": extract_cp_prereq("", "", desc),
+                    "coreqs": extract_coreqs(desc),
+                    "incompatibles": extract_incompatibles(desc),
+                    "program_restrictions": extract_program_restrictions(desc),
+                    "from_curriculum_api": True
+                }
+                print(f"[COURSE WORKER] ✅ {clean_code} recovered from Funnelback! Prereqs: {fallback_groups}, Campuses: {clean_cmps}", flush=True)
+                return fb_res
+
+    print(f"[COURSE WORKER] ❌ {clean_code} could not be resolved from any source.", flush=True)
     return None
+
+
+def lookup_courses_batch(codes: list, selected_year: int = None):
+    """Concurrently enriches a batch of courses using 12 pooled threads."""
+    if not codes:
+        return
+    if selected_year is None:
+        selected_year = datetime.now().year
+
+    live_cache = get_live_course_cache()
+    http_session = get_http_session()
+    to_fetch = []
+
+    for raw_c in codes:
+        c = str(raw_c).replace(" ", "").upper().strip()
+        if not c:
+            continue
+        if c in live_cache:
+            cached = live_cache[c]
+            if isinstance(cached, dict):
+                catalog[c] = cached
+            elif c in catalog:
+                catalog[c]["from_curriculum_api"] = True
+        elif not catalog.get(c, {}).get("from_curriculum_api"):
+            to_fetch.append(c)
+
+    to_fetch = list(dict.fromkeys(to_fetch))
+    print(f"[BATCH LOOKUP] Request to enrich {len(codes)} codes. Codes needing network fetch: {to_fetch}", flush=True)
+    if not to_fetch:
+        return
+
+    t0 = time.time()
+    with ThreadPoolExecutor(max_workers=12) as executor:
+        future_map = {
+            executor.submit(
+                _fetch_course_api_worker,
+                http_session,
+                c,
+                selected_year,
+                catalog.get(c, {}).get("offerings", [])
+            ): c
+            for c in to_fetch
+        }
+        for fut in as_completed(future_map):
+            c = future_map[fut]
+            try:
+                res = fut.result()
+                if res:
+                    live_cache[c] = res
+                    catalog[c] = res
+                    print(f"[BATCH LOOKUP] ✅ {c} cached successfully.", flush=True)
+                else:
+                    live_cache[c] = "NOT_FOUND"
+                    if c in catalog:
+                        catalog[c]["from_curriculum_api"] = True
+                    print(f"[BATCH LOOKUP] ❌ {c} marked NOT_FOUND.", flush=True)
+            except Exception as e:
+                live_cache[c] = "NOT_FOUND"
+                print(f"[BATCH LOOKUP] ⚠️ {c} exception: {e}", flush=True)
+
+    print(f"[BATCH LOOKUP] ✅ Finished batch of {len(to_fetch)} courses in {time.time() - t0:.2f}s", flush=True)
 
 
 def lookup_course(clean_code: str, selected_year: int = None):
@@ -741,61 +860,6 @@ def lookup_course(clean_code: str, selected_year: int = None):
     return None
 
 
-def lookup_courses_batch(codes: list, selected_year: int = None):
-    """Concurrently enriches a batch of courses using 12 pooled threads."""
-    if not codes:
-        return
-    if selected_year is None:
-        selected_year = datetime.now().year
-
-    live_cache = get_live_course_cache()
-    http_session = get_http_session()
-    to_fetch = []
-
-    for raw_c in codes:
-        c = str(raw_c).replace(" ", "").upper().strip()
-        if not c:
-            continue
-        if c in live_cache:
-            cached = live_cache[c]
-            if isinstance(cached, dict):
-                catalog[c] = cached
-            elif c in catalog:
-                catalog[c]["from_curriculum_api"] = True
-        elif not catalog.get(c, {}).get("from_curriculum_api"):
-            to_fetch.append(c)
-
-    to_fetch = list(dict.fromkeys(to_fetch))
-    if not to_fetch:
-        return
-
-    t0 = time.time()
-    with ThreadPoolExecutor(max_workers=12) as executor:
-        future_map = {
-            executor.submit(
-                _fetch_course_api_worker,
-                http_session,
-                c,
-                selected_year,
-                catalog.get(c, {}).get("offerings", [])
-            ): c
-            for c in to_fetch
-        }
-        for fut in as_completed(future_map):
-            c = future_map[fut]
-            try:
-                res = fut.result()
-                if res:
-                    live_cache[c] = res
-                    catalog[c] = res
-                else:
-                    live_cache[c] = "NOT_FOUND"
-                    if c in catalog:
-                        catalog[c]["from_curriculum_api"] = True
-            except Exception:
-                live_cache[c] = "NOT_FOUND"
-
-    print(f"[BATCH LOOKUP] ✅ Enriched {len(to_fetch)} courses concurrently in {time.time() - t0:.2f}s", flush=True)
 
 
 catalog = load_full_catalog()
@@ -1573,33 +1637,36 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
     2. Checks mandatory co-requisites (satisfied if in plan or holding zone).
     3. Checks cumulative credit points completed in plan.
     4. Checks course prerequisites against both Plan and Holding Zone.
-       - If satisfied in plan: returns eligible term.
-       - If satisfied via holding zone: returns eligible with holding notification.
     """
     if holding_set is None:
         holding_set = set(st.session_state.get("holding_zone", []))
 
     code = c_info.get("code")
-    all_planned_or_held = set(planned_coords.keys()) | holding_set
+    cleaned_planned = {str(k).replace(" ", "").upper().strip(): v for k, v in planned_coords.items()}
+    cleaned_holding = {str(k).replace(" ", "").upper().strip() for k in holding_set}
+    all_planned_or_held = set(cleaned_planned.keys()) | cleaned_holding
 
     # 1. Degree compatibility & Anti-requisite check
     is_compat, compat_msg = is_course_degree_compatible(c_info, selected_degree_code, all_planned_or_held, catalog)
     if not is_compat:
+        print(f"[PREREQ EVAL] 🚫 {code} incompatible: {compat_msg}", flush=True)
         return False, None, compat_msg, []
 
-    # 2. Mandatory Co-requisites Check (satisfied if in plan OR holding zone)
+    # 2. Mandatory Co-requisites Check
     coreqs = c_info.get("coreqs", [])
     missing_coreqs = []
     holding_coreqs = []
     for cr in coreqs:
-        if cr in planned_coords:
+        cr_clean = str(cr).replace(" ", "").upper().strip()
+        if cr_clean in cleaned_planned:
             continue
-        elif cr in holding_set:
-            holding_coreqs.append(cr)
+        elif cr_clean in cleaned_holding:
+            holding_coreqs.append(cr_clean)
         else:
-            missing_coreqs.append(cr)
+            missing_coreqs.append(cr_clean)
 
     if missing_coreqs:
+        print(f"[PREREQ EVAL] ⚠️ {code} missing coreqs: {missing_coreqs}", flush=True)
         return False, None, f"⚠️ Requires co-enrolment in: {', '.join(missing_coreqs)}", []
 
     # 3. Calculate cumulative CP progression by term in plan
@@ -1622,16 +1689,19 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
                 eligible_term_for_cp = t
                 break
         if not eligible_term_for_cp:
+            print(f"[PREREQ EVAL] ⚠️ {code} requires {min_cp} CP, plan reaches {running_cp} CP", flush=True)
             return False, None, f"Requires at least {min_cp} CP completed prior (your plan only reaches {running_cp} CP)", []
         latest_term_cp = term_index(eligible_term_for_cp[0], eligible_term_for_cp[1]) - 1
         cp_sat_msg = f"{min_cp} CP completed"
 
-    # 5. Course Prerequisites Check (AND/OR Groups) across Plan AND Holding Zone
+    # 5. Course Prerequisites Check (AND/OR Groups)
     p_groups = c_info.get("prereq_groups", [])
     latest_term_courses = 0
     missing_groups = []
     sat_in_plan_details = []
     holding_prereqs_used = []
+
+    print(f"[PREREQ EVAL] Checking {code} | prereq_groups={p_groups} | min_cp={min_cp} | planned={list(cleaned_planned.keys())}", flush=True)
 
     for g in p_groups:
         needed = g.get("count", 1)
@@ -1640,32 +1710,32 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
         sat_holding = []
 
         for p in g_courses:
-            if p in planned_coords:
-                pyr, ptr = planned_coords[p]
-                sat_plan.append((p, pyr, ptr))
-            elif p in holding_set:
-                sat_holding.append(p)
+            p_clean = str(p).replace(" ", "").upper().strip()
+            if p_clean in cleaned_planned:
+                pyr, ptr = cleaned_planned[p_clean]
+                sat_plan.append((p_clean, pyr, ptr))
+            elif p_clean in cleaned_holding:
+                sat_holding.append(p_clean)
 
         total_satisfied = len(sat_plan) + len(sat_holding)
         if total_satisfied < needed:
             missing_groups.append(g)
         else:
-            # Prefer prerequisites completed in the plan
             plan_take = min(len(sat_plan), needed)
             for sc in sat_plan[:plan_take]:
                 latest_term_courses = max(latest_term_courses, term_index(sc[1], sc[2]))
                 sat_in_plan_details.append(f"{sc[0]} (Y{sc[1]} T{sc[2]})")
 
-            # Remaining requirements fulfilled by holding zone
             rem_needed = needed - plan_take
             for hc in sat_holding[:rem_needed]:
                 holding_prereqs_used.append(hc)
 
     if missing_groups:
         missing_str = format_prereq_display(missing_groups)
+        print(f"[PREREQ EVAL] ❌ {code} missing prerequisites: {missing_str}", flush=True)
         return False, None, f"Prerequisites needed: {missing_str}", missing_groups
 
-    # CASE A: Prerequisites met, but one or more are currently in the HOLDING ZONE
+    # CASE A: Prerequisites met via holding zone
     if holding_prereqs_used or holding_coreqs:
         parts = []
         if sat_in_plan_details:
@@ -1678,13 +1748,20 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
             parts.append(cp_sat_msg)
 
         expl_msg = "📦 " + " | ".join(parts)
-        print(f"[PREREQ EVAL] Course {code} eligible via holding prereqs: {holding_prereqs_used}", flush=True)
-        # ELIGIBLE: Can be added to holding and shows when 'only_prereqs_met' is checked
+        print(f"[PREREQ EVAL] {code} -> Eligible via holding zone: {expl_msg}", flush=True)
         return True, (1, 1), expl_msg, []
 
     # CASE B: All prerequisites fully scheduled in the PLAN
     overall_latest_rank = max(latest_term_courses, latest_term_cp)
-    ready_yr, ready_tr = term_from_index(overall_latest_rank + 1) if overall_latest_rank > 0 else (1, 1)
+
+    if overall_latest_rank > 0:
+        ready_yr, ready_tr = term_from_index(overall_latest_rank + 1)
+        include_t3_active = st.session_state.get("include_t3_cb", False)
+        if not include_t3_active and ready_tr == 3:
+            ready_yr += 1
+            ready_tr = 1
+    else:
+        ready_yr, ready_tr = (1, 1)
 
     all_sat_reasons = []
     if cp_sat_msg:
@@ -1694,8 +1771,11 @@ def evaluate_elective_prereqs(c_info: dict, plan: dict, planned_coords: dict, se
 
     if all_sat_reasons:
         reasons_str = " & ".join(all_sat_reasons)
-        return True, (ready_yr, ready_tr), f"Prerequisites met via {reasons_str} — Eligible from Year {ready_yr} Trimester {ready_tr}", []
+        expl_msg = f"Prerequisites met via {reasons_str} — Eligible from Year {ready_yr} Trimester {ready_tr}"
+        print(f"[PREREQ EVAL] {code} -> ✅ {expl_msg}", flush=True)
+        return True, (ready_yr, ready_tr), expl_msg, []
 
+    print(f"[PREREQ EVAL] {code} -> ℹ️ No prerequisites required — Eligible from Year 1 Trimester 1", flush=True)
     return True, (1, 1), "No prerequisites required — Eligible from Year 1 Trimester 1", []
 
 plan_warnings, plan_satisfied = validate_plan(st.session_state.plan, catalog)
@@ -2641,7 +2721,7 @@ if st.session_state.get("selected_degree"):
                 seen_cand.add(c_code)
 
         # --- MULTISELECT CONTROLS & FILTER BAR ---
-        col_f1, col_f2, col_f3, col_f4 = st.columns([1.5, 1.1, 1.2, 1.2])
+        col_f1, col_f2, col_camp = st.columns([1.6, 1.2, 1.6])
         with col_f1:
             all_groups = sorted(list({c.get("group", "Other") for c in candidates if c.get("group")}))
             sel_groups = st.multiselect(
@@ -2658,6 +2738,16 @@ if st.session_state.get("selected_degree"):
                 placeholder="All levels...",
                 key="sug_filter_lvls"
             )
+        with col_camp:
+            campus_options = ["Gold Coast", "Brisbane South (Nathan)", "Brisbane City (South Bank)", "Logan", "Online"]
+            sel_campuses = st.multiselect(
+                "Campus Offering",
+                options=campus_options,
+                placeholder="All campuses (e.g. Gold Coast)...",
+                key="sug_filter_campuses"
+            )
+
+        col_f3, col_f4 = st.columns([1, 1])
         with col_f3:
             all_areas = sorted(list({get_course_subject_area(c["code"]) for c in candidates if c.get("code")}))
             sel_areas = st.multiselect(
@@ -2689,8 +2779,8 @@ if st.session_state.get("selected_degree"):
 
         kw = sug_keyword.strip().lower()
 
-        # Reset to Page 1 whenever any filter changes (including excluded areas)
-        filter_sig = (tuple(sel_groups), tuple(sel_levels), tuple(sel_areas), tuple(excl_areas), kw, only_prereqs_met, per_page)
+        # Reset to Page 1 whenever any filter changes
+        filter_sig = (tuple(sel_groups), tuple(sel_levels), tuple(sel_campuses), tuple(sel_areas), tuple(excl_areas), kw, only_prereqs_met, per_page)
         if st.session_state.get("last_sug_filter_sig") != filter_sig:
             st.session_state.last_sug_filter_sig = filter_sig
             st.session_state.sug_page = 1
@@ -2714,6 +2804,8 @@ if st.session_state.get("selected_degree"):
                 continue
             if excl_areas and area in excl_areas:
                 continue
+            if sel_campuses and not check_campus_match(c.get("campuses", []), sel_campuses):
+                continue
             if kw:
                 searchable = f"{code} {c.get('title', '')} {c.get('description', '')}".lower()
                 if kw not in searchable:
@@ -2730,7 +2822,6 @@ if st.session_state.get("selected_degree"):
 
             pre_filtered.append(c)
 
-        # Sort pre-filtered so Recommended Electives and lower-level courses are checked first
         pre_filtered.sort(key=lambda c: (
             not ((c["code"] in deg_flex_set) or c.get("is_degree_recommended", False)),
             get_course_level_num(c["code"]),
@@ -2746,7 +2837,6 @@ if st.session_state.get("selected_degree"):
         unscanned_remaining = 0
 
         if not only_prereqs_met:
-            # No prereq filtering needed -> slice exact page and enrich ONLY those page items!
             total_results = len(pre_filtered)
             total_pages = max(1, (total_results + per_page - 1) // per_page)
             curr_page = min(curr_page, total_pages)
@@ -2760,7 +2850,8 @@ if st.session_state.get("selected_degree"):
             page_items = []
             for c in raw_slice:
                 code = c["code"]
-                c_full = dict(catalog.get(code, c))
+                cached_obj = live_cache.get(code)
+                c_full = dict(cached_obj) if isinstance(cached_obj, dict) else dict(catalog.get(code, c))
                 is_rec = (code in deg_flex_set) or c.get("is_degree_recommended", False)
                 c_full["is_degree_recommended"] = is_rec
 
@@ -2781,14 +2872,10 @@ if st.session_state.get("selected_degree"):
                     "subject_area": c_full.get("subject_area") or get_course_subject_area(code)
                 })
         else:
-            # Prereq filter is ON -> verify in parallel batches of 30 until current page (+ lookahead) is filled!
-            # If pool is small (<= 60, e.g. keyword search), verify all at once for exact count.
             verify_all = len(pre_filtered) <= 60
             target_valid_needed = len(pre_filtered) if verify_all else (end_idx + per_page)
 
             BATCH_SIZE = 30
-            MAX_UNCACHED_FETCHES = 90  # Hard safety cap so a single render never blocks > ~1s
-            uncached_fetched = 0
             idx_cursor = 0
 
             while idx_cursor < len(pre_filtered):
@@ -2802,18 +2889,25 @@ if st.session_state.get("selected_degree"):
 
                 if uncached_in_chunk:
                     lookup_courses_batch(uncached_in_chunk)
-                    uncached_fetched += len(uncached_in_chunk)
 
                 for c in chunk:
                     code = c["code"]
-                    c_full = dict(catalog.get(code, c))
+                    cached_obj = live_cache.get(code)
+                    c_full = dict(cached_obj) if isinstance(cached_obj, dict) else dict(catalog.get(code, c))
                     is_rec = (code in deg_flex_set) or c.get("is_degree_recommended", False)
                     c_full["is_degree_recommended"] = is_rec
 
-                    # Re-check level/facets in case stub lacked metadata
                     if get_course_level_num(code) >= 6:
                         continue
                     if sel_groups and c_full.get("group", "Other") not in sel_groups:
+                        continue
+
+                    area = c_full.get("subject_area") or get_course_subject_area(code)
+                    if sel_areas and area not in sel_areas:
+                        continue
+                    if excl_areas and area in excl_areas:
+                        continue
+                    if sel_campuses and not check_campus_match(c_full.get("campuses", []), sel_campuses):
                         continue
 
                     is_compat, _ = is_course_degree_compatible(c_full, sel_deg_code, all_planned_or_held, catalog)
@@ -2822,12 +2916,6 @@ if st.session_state.get("selected_degree"):
                     )
 
                     if not is_compat or not is_elig:
-                        continue
-
-                    area = c_full.get("subject_area") or get_course_subject_area(code)
-                    if sel_areas and area not in sel_areas:
-                        continue
-                    if excl_areas and area in excl_areas:
                         continue
 
                     filtered_sug.append({
@@ -2840,12 +2928,10 @@ if st.session_state.get("selected_degree"):
                         "explanation": expl_msg,
                         "missing": missing,
                         "level": get_course_level_label(code),
-                        "subject_area": c_full.get("subject_area") or get_course_subject_area(code)
+                        "subject_area": area
                     })
 
                 if not verify_all and len(filtered_sug) >= target_valid_needed:
-                    break
-                if uncached_fetched >= MAX_UNCACHED_FETCHES and len(filtered_sug) > start_idx:
                     break
 
             unscanned_remaining = max(0, len(pre_filtered) - idx_cursor)
