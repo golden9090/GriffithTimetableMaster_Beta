@@ -296,17 +296,25 @@ def extract_cp_prereq(rule_def: str = "", rule_sum: str = "", desc: str = "") ->
 def parse_rule_definition_to_groups(rule_def: str, rule_sum: str = "") -> list:
     """Parses Curriculum API ruleDefinition accurately into AND / OR course groups."""
     groups = []
-    text_to_parse = rule_def if (rule_def and "COURSES" in rule_def.upper()) else rule_sum
+    # Choose rule_def if it contains course codes or COURSES; fallback to rule_sum
+    text_to_parse = ""
+    if rule_def and (extract_course_codes(rule_def) or "COURSES" in rule_def.upper()):
+        text_to_parse = rule_def
+    elif rule_sum and extract_course_codes(rule_sum):
+        text_to_parse = rule_sum
+    else:
+        text_to_parse = rule_def or rule_sum
+
     if not text_to_parse:
         return groups
 
-    and_clauses = re.split(r'\s+AND\s+', text_to_parse, flags=re.I)
+    and_clauses = re.split(r'\s+AND\s+|;\s*', text_to_parse, flags=re.I)
     for clause in and_clauses:
         clause = clause.strip()
         if not clause:
             continue
 
-        or_subclauses = re.split(r'\s+OR\s+|/', clause, flags=re.I)
+        or_subclauses = re.split(r'\s+OR\s+|/|,\s*', clause, flags=re.I)
         all_codes_in_clause = []
         min_count = 1
 
@@ -325,6 +333,10 @@ def parse_rule_definition_to_groups(rule_def: str, rule_sum: str = "") -> list:
                 "count": min(min_count, len(all_codes_in_clause)),
                 "courses": all_codes_in_clause
             })
+
+    # Fallback to rule_sum if rule_def yielded no codes
+    if not groups and rule_sum and rule_sum != text_to_parse:
+        return parse_rule_definition_to_groups("", rule_sum)
 
     return groups
 
@@ -446,7 +458,12 @@ def load_full_catalog():
                             continue
                         code = str(cat_numbers[0]).replace(" ", "").upper().strip()
                         desc = meta.get("description", [""])[0] or ""
-                        fallback_groups = parse_rule_definition_to_groups("", desc)
+                        raw_cmps = meta.get("campusName", []) or meta.get("campus", [])
+                        clean_cmps = list(dict.fromkeys([normalize_campus_name(x) for x in raw_cmps if normalize_campus_name(x)]))
+
+                        prereq_match = re.search(r'(?:pre-?requisite(?:s)?)\s*[:\-]?\s*([^.;\n<]+)', desc, re.I)
+                        prereq_text = prereq_match.group(1) if prereq_match else desc
+                        fallback_groups = parse_rule_definition_to_groups("", prereq_text)
 
                         catalog[code] = {
                             "code": code,
@@ -454,6 +471,7 @@ def load_full_catalog():
                             "credit_points": meta.get("creditPoints", ["10"])[0],
                             "description": desc,
                             "offerings": list(set(meta.get("nextOffering", []))),
+                            "campuses": clean_cmps,  # <-- Added missing campus list
                             "career": meta.get("academicCareerName", ["Undergraduate"])[0],
                             "group": meta.get("academicGrpDescription", ["Other"])[0],
                             "subject_area": get_course_subject_area(code),
@@ -532,10 +550,9 @@ def get_live_course_cache():
     return {}
 
 def _fetch_course_api_worker(http_session, clean_code: str, selected_year: int, catalog_offerings: list):
-    """Thread-safe worker (no st.* calls inside) to fetch Curriculum API metadata."""
-    subscription_key = "b8ae10d400ef42f89a127abe4a760e46"
+    """Thread-safe worker to fetch Curriculum API metadata with dual keys and fallback extraction."""
+    keys_to_try = ["b8ae10d400ef42f89a127abe4a760e46", "5145ba30d5734d4cb6047c47527ef930"]
 
-    # Prioritize the trimester listed in catalog_offerings so Attempt #1 usually hits 200 OK
     offs_lower = [str(o).lower() for o in (catalog_offerings or [])]
     preferred_tris = []
     if any("trimester 1" in o or "t1" in o for o in offs_lower):
@@ -550,116 +567,132 @@ def _fetch_course_api_worker(http_session, clean_code: str, selected_year: int, 
 
     years_to_try = list(dict.fromkeys([y for y in [selected_year, 2026, 2027, 2025] if y]))[:2]
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Ocp-Apim-Subscription-Key": subscription_key,
-        "Origin": "https://my.griffith.edu.au",
-        "Referer": "https://my.griffith.edu.au/"
-    }
-
     for yr in years_to_try:
         yr_short = str(yr)[-2:]
         terms_to_try = [f"3{yr_short}{t_dig}" for t_dig in preferred_tris]
 
         for term_code in terms_to_try:
-            url = f"https://api-lt.griffith.edu.au/curriculumapi/v1/course/{clean_code}/{yr}/{term_code}?subscription-key={subscription_key}"
-            try:
-                resp = http_session.get(url, headers=headers, timeout=4)
-                if resp.status_code == 200:
-                    data = resp.json()
-                    mapped = data.get("mappedData", {}).get("components", {})
+            for sub_key in keys_to_try:
+                headers = {
+                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                    "Ocp-Apim-Subscription-Key": sub_key,
+                    "Origin": "https://my.griffith.edu.au",
+                    "Referer": "https://my.griffith.edu.au/"
+                }
+                url = f"https://api-lt.griffith.edu.au/curriculumapi/v1/course/{clean_code}/{yr}/{term_code}?subscription-key={sub_key}"
+                try:
+                    resp = http_session.get(url, headers=headers, timeout=4)
+                    if resp.status_code == 200:
+                        data = resp.json()
+                        mapped = data.get("mappedData", {}).get("components", {})
 
-                    prereq_groups, coreqs, incompatibles = [], [], []
-                    min_cp = 0
+                        prereq_groups, coreqs, incompatibles = [], [], []
+                        min_cp = 0
 
-                    req_obj = mapped.get("crseRequiste", {}).get("value", {})
-                    if isinstance(req_obj, dict):
-                        for r in req_obj.get("requisites", []):
-                            rtype = str(r.get("type", "")).upper()
-                            rule_def = str(r.get("ruleDefinition", ""))
-                            rule_sum = str(r.get("ruleSummary", ""))
+                        req_obj = mapped.get("crseRequiste", {}).get("value", {})
+                        if isinstance(req_obj, dict):
+                            for r in req_obj.get("requisites", []):
+                                rtype = str(r.get("type", "")).upper()
+                                rule_def = str(r.get("ruleDefinition", ""))
+                                rule_sum = str(r.get("ruleSummary", ""))
 
-                            cp_req = extract_cp_prereq(rule_def, rule_sum, "")
-                            if cp_req > min_cp:
-                                min_cp = cp_req
+                                cp_req = extract_cp_prereq(rule_def, rule_sum, "")
+                                if cp_req > min_cp:
+                                    min_cp = cp_req
 
-                            if "PRE" in rtype:
-                                groups = parse_rule_definition_to_groups(rule_def, rule_sum)
-                                for g in groups:
+                                if "CO" in rtype and "PRE" not in rtype:
+                                    coreqs.extend([c for c in extract_course_codes(f"{rule_def} {rule_sum}") if c != clean_code])
+                                elif "ANTI" in rtype or "INCOMPATIBLE" in rtype:
+                                    incompatibles.extend([c for c in extract_course_codes(f"{rule_def} {rule_sum}") if c != clean_code])
+                                else:
+                                    # Matches PRE, REQUISITE, ENROLMENT REQUISITE, etc.
+                                    groups = parse_rule_definition_to_groups(rule_def, rule_sum)
+                                    for g in groups:
+                                        filtered_codes = [c for c in g.get("courses", []) if c != clean_code]
+                                        if filtered_codes:
+                                            prereq_groups.append({"count": min(g.get("count", 1), len(filtered_codes)), "courses": filtered_codes})
+
+                        other_req = mapped.get("crseOthrRequiste", {}).get("value") or ""
+                        desc_text = mapped.get("crseDescr", {}).get("value", "")
+                        cmmt_pstn = mapped.get("crseCmmtCrsePstn", {}).get("value") or ""
+                        combined_req_text = f"{other_req} {desc_text} {cmmt_pstn}"
+
+                        desc_cp = extract_cp_prereq("", "", combined_req_text)
+                        if desc_cp > min_cp:
+                            min_cp = desc_cp
+
+                        # Extract text-based prerequisites if crseRequiste was empty
+                        if not prereq_groups:
+                            prereq_match = re.search(r'(?:pre-?requisite(?:s)?|prior to enrolling[^.;\n]*completed)\s*[:\-]?\s*([^.;\n<]+)', combined_req_text, re.I)
+                            if prereq_match:
+                                text_groups = parse_rule_definition_to_groups("", prereq_match.group(1))
+                                for g in text_groups:
                                     filtered_codes = [c for c in g.get("courses", []) if c != clean_code]
                                     if filtered_codes:
                                         prereq_groups.append({"count": min(g.get("count", 1), len(filtered_codes)), "courses": filtered_codes})
-                            elif "CO" in rtype:
-                                coreqs.extend([c for c in extract_course_codes(f"{rule_def} {rule_sum}") if c != clean_code])
-                            elif "ANTI" in rtype or "INCOMPATIBLE" in rtype:
-                                incompatibles.extend([c for c in extract_course_codes(f"{rule_def} {rule_sum}") if c != clean_code])
 
-                    other_req = mapped.get("crseOthrRequiste", {}).get("value") or ""
-                    desc_text = mapped.get("crseDescr", {}).get("value", "")
-                    cmmt_pstn = mapped.get("crseCmmtCrsePstn", {}).get("value") or ""
-                    combined_req_text = f"{other_req} {desc_text} {cmmt_pstn}"
+                        incomp_match = re.search(r'(?:incompatible(?:s)?|anti-?requisite(?:s)?)\s*[:\-]?\s*([^.;\n<]+)', combined_req_text, re.I)
+                        if incomp_match:
+                            incompatibles.extend([c for c in extract_course_codes(incomp_match.group(1)) if c != clean_code])
 
-                    desc_cp = extract_cp_prereq("", "", combined_req_text)
-                    if desc_cp > min_cp:
-                        min_cp = desc_cp
+                        prog_restrictions = extract_program_restrictions(combined_req_text, mapped_components=mapped)
 
-                    incomp_match = re.search(r'(?:incompatible(?:s)?|anti-?requisite(?:s)?)\s*[:\-]?\s*([^.;\n<]+)', combined_req_text, re.I)
-                    if incomp_match:
-                        incompatibles.extend([c for c in extract_course_codes(incomp_match.group(1)) if c != clean_code])
+                        campuses = []
+                        cmps_val = mapped.get("crseCmps", {}).get("value", [])
+                        if isinstance(cmps_val, list):
+                            for c_item in cmps_val:
+                                if isinstance(c_item, dict):
+                                    c_name = c_item.get("value") or c_item.get("name")
+                                    if c_name: campuses.append(normalize_campus_name(c_name))
+                                elif isinstance(c_item, str):
+                                    campuses.append(normalize_campus_name(c_item))
+                        elif isinstance(cmps_val, dict):
+                            c_name = cmps_val.get("value")
+                            if c_name: campuses.append(normalize_campus_name(c_name))
 
-                    prog_restrictions = extract_program_restrictions(combined_req_text, mapped_components=mapped)
+                        ofrg2_rows = mapped.get("crseOfrg2CrseOfrg", {}).get("value", {}).get("rows", [])
+                        for r in ofrg2_rows:
+                            cmps_cell = r.get("crseOfrg2CmpsId", {})
+                            if isinstance(cmps_cell, dict) and cmps_cell.get("value"):
+                                campuses.append(normalize_campus_name(cmps_cell["value"]))
 
-                    campuses = []
-                    cmps_val = mapped.get("crseCmps", {}).get("value", [])
-                    if isinstance(cmps_val, list):
-                        for c_item in cmps_val:
-                            if isinstance(c_item, dict):
-                                c_name = c_item.get("value") or c_item.get("name")
-                                if c_name: campuses.append(normalize_campus_name(c_name))
-                            elif isinstance(c_item, str):
-                                campuses.append(normalize_campus_name(c_item))
-                    elif isinstance(cmps_val, dict):
-                        c_name = cmps_val.get("value")
-                        if c_name: campuses.append(normalize_campus_name(c_name))
+                        # Preserve existing campuses if API response lacks them
+                        catalog_cmps = catalog.get(clean_code, {}).get("campuses", [])
+                        final_campuses = campuses if campuses else list(catalog_cmps or [])
+                        final_campuses = list(dict.fromkeys([c for c in final_campuses if c]))
 
-                    ofrg2_rows = mapped.get("crseOfrg2CrseOfrg", {}).get("value", {}).get("rows", [])
-                    for r in ofrg2_rows:
-                        cmps_cell = r.get("crseOfrg2CmpsId", {})
-                        if isinstance(cmps_cell, dict) and cmps_cell.get("value"):
-                            campuses.append(normalize_campus_name(cmps_cell["value"]))
+                        final_offerings = list(catalog_offerings or [])
+                        if not final_offerings:
+                            tri_val = mapped.get("crseTri", {}).get("value", [])
+                            if isinstance(tri_val, list): final_offerings.extend(tri_val)
+                            elif isinstance(tri_val, str): final_offerings.append(tri_val)
 
-                    campuses = list(dict.fromkeys([c for c in campuses if c]))
+                        title = data.get("name") or mapped.get("crseShrtDescr", {}).get("value") or clean_code
+                        cp_val = mapped.get("crseAwrdCrdtPnts", {}).get("value", {})
+                        cp = str(cp_val.get("value", 10) if isinstance(cp_val, dict) else data.get("unitsMinimum", 10))
 
-                    final_offerings = list(catalog_offerings or [])
-                    if not final_offerings:
-                        tri_val = mapped.get("crseTri", {}).get("value", [])
-                        if isinstance(tri_val, list): final_offerings.extend(tri_val)
-                        elif isinstance(tri_val, str): final_offerings.append(tri_val)
-
-                    title = data.get("name") or mapped.get("crseShrtDescr", {}).get("value") or clean_code
-                    cp_val = mapped.get("crseAwrdCrdtPnts", {}).get("value", {})
-                    cp = str(cp_val.get("value", 10) if isinstance(cp_val, dict) else data.get("unitsMinimum", 10))
-
-                    return {
-                        "code": clean_code,
-                        "title": title,
-                        "credit_points": cp,
-                        "description": desc_text,
-                        "offerings": list(dict.fromkeys(final_offerings)),
-                        "campuses": campuses,
-                        "career": data.get("subtype", "Undergraduate"),
-                        "group": data.get("orgParent", "Other"),
-                        "subject_area": get_course_subject_area(clean_code),
-                        "prereq_groups": prereq_groups,
-                        "prereq_display": format_prereq_display(prereq_groups),
-                        "min_cp_prereq": min_cp,
-                        "coreqs": list(dict.fromkeys(coreqs)),
-                        "incompatibles": list(dict.fromkeys(incompatibles)),
-                        "program_restrictions": prog_restrictions,
-                        "from_curriculum_api": True
-                    }
-            except Exception:
-                continue
+                        return {
+                            "code": clean_code,
+                            "title": title,
+                            "credit_points": cp,
+                            "description": desc_text,
+                            "offerings": list(dict.fromkeys(final_offerings)),
+                            "campuses": final_campuses,
+                            "career": data.get("subtype", "Undergraduate"),
+                            "group": data.get("orgParent", "Other"),
+                            "subject_area": get_course_subject_area(clean_code),
+                            "prereq_groups": prereq_groups,
+                            "prereq_display": format_prereq_display(prereq_groups),
+                            "min_cp_prereq": min_cp,
+                            "coreqs": list(dict.fromkeys(coreqs)),
+                            "incompatibles": list(dict.fromkeys(incompatibles)),
+                            "program_restrictions": prog_restrictions,
+                            "from_curriculum_api": True
+                        }
+                    elif resp.status_code in [401, 403]:
+                        continue  # Try next subscription key
+                except Exception:
+                    continue
 
     return None
 
@@ -1808,7 +1841,9 @@ with st.sidebar:
                             st.session_state.plan = prescribed_plan
                             st.session_state.holding_zone = holding_alts
 
-                            all_needed_codes = [c for c_list in prescribed_plan.values() for c in c_list] + holding_alts
+                            # Ensure prescribed and flexible courses are batch-enriched
+                            all_needed_codes = [c for c_list in prescribed_plan.values() for c in c_list] + holding_alts + flex_courses
+                            lookup_courses_batch(all_needed_codes)
                             for c_code in all_needed_codes:
                                 if c_code not in catalog:
                                     lookup_course(c_code)
@@ -2606,13 +2641,13 @@ if st.session_state.get("selected_degree"):
                 seen_cand.add(c_code)
 
         # --- MULTISELECT CONTROLS & FILTER BAR ---
-        col_f1, col_f2, col_f3 = st.columns([1.8, 1.3, 1.4])
+        col_f1, col_f2, col_f3, col_f4 = st.columns([1.5, 1.1, 1.2, 1.2])
         with col_f1:
             all_groups = sorted(list({c.get("group", "Other") for c in candidates if c.get("group")}))
             sel_groups = st.multiselect(
                 "Discipline / Academic Group",
                 options=all_groups,
-                placeholder="All disciplines (or select multiple...)",
+                placeholder="All disciplines...",
                 key="sug_filter_grps"
             )
         with col_f2:
@@ -2620,16 +2655,23 @@ if st.session_state.get("selected_degree"):
             sel_levels = st.multiselect(
                 "Course Level",
                 options=level_options,
-                placeholder="All levels (or select multiple...)",
+                placeholder="All levels...",
                 key="sug_filter_lvls"
             )
         with col_f3:
             all_areas = sorted(list({get_course_subject_area(c["code"]) for c in candidates if c.get("code")}))
             sel_areas = st.multiselect(
-                "Area of Study (Subject Code)",
+                "Include Subject Area",
                 options=all_areas,
-                placeholder="e.g. MSC, ESC, NSC, ENG...",
+                placeholder="e.g. MSC, ESC, ENG...",
                 key="sug_filter_areas"
+            )
+        with col_f4:
+            excl_areas = st.multiselect(
+                "Exclude Subject Area",
+                options=all_areas,
+                placeholder="e.g. IBA, CCJ...",
+                key="sug_filter_excl_areas"
             )
 
         col_search, col_tgl, col_pp = st.columns([2.2, 1.8, 0.8])
@@ -2647,8 +2689,8 @@ if st.session_state.get("selected_degree"):
 
         kw = sug_keyword.strip().lower()
 
-        # Reset to Page 1 whenever any filter changes
-        filter_sig = (tuple(sel_groups), tuple(sel_levels), tuple(sel_areas), kw, only_prereqs_met, per_page)
+        # Reset to Page 1 whenever any filter changes (including excluded areas)
+        filter_sig = (tuple(sel_groups), tuple(sel_levels), tuple(sel_areas), tuple(excl_areas), kw, only_prereqs_met, per_page)
         if st.session_state.get("last_sug_filter_sig") != filter_sig:
             st.session_state.last_sug_filter_sig = filter_sig
             st.session_state.sug_page = 1
@@ -2669,6 +2711,8 @@ if st.session_state.get("selected_degree"):
             if sel_levels and lvl not in sel_levels:
                 continue
             if sel_areas and area not in sel_areas:
+                continue
+            if excl_areas and area in excl_areas:
                 continue
             if kw:
                 searchable = f"{code} {c.get('title', '')} {c.get('description', '')}".lower()
@@ -2778,6 +2822,12 @@ if st.session_state.get("selected_degree"):
                     )
 
                     if not is_compat or not is_elig:
+                        continue
+
+                    area = c_full.get("subject_area") or get_course_subject_area(code)
+                    if sel_areas and area not in sel_areas:
+                        continue
+                    if excl_areas and area in excl_areas:
                         continue
 
                     filtered_sug.append({
